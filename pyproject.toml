@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dirigo-nidaq"
+version = "0.1.0"
+description = "Plugin to use National Instruments DAQ cards in various Device roles within Dirigo."
+authors = [
+    {name = "Timothy D. Weber", email = "tweber@mit.edu"}
+]
+license = "MIT"
+license-files = ["LICENSE"]
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "dirigo>=0.4",
+    "nidaqmx",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff==0.17.4",
+    "ty==0.0.99",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --import-mode=importlib"
+markers = [
+    "hardware: accesses physical equipment and requires --hardware",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+
+[tool.ruff.lint]
+preview = true
+explicit-preview-rules = true
+select = [
+    "E", "W", "F", "I", "UP", "B", "SIM", "ANN", "PT", "RUF", "N", "NPY",
+    "PERF", "E302",
+]
+
+[tool.ty.environment]
+python-version = "3.14"
