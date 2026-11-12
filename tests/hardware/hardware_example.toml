@@ -1,0 +1,20 @@
+[test]
+scanner = "fast_scanner"
+amplitude = "1 deg"
+final_amplitude = "0 deg"
+
+[devices.fast_scanner]
+category = "scanners"
+driver = "nidaq_resonant"
+
+[devices.fast_scanner.identity]
+manufacturer = "Cambridge Technologies"
+model = "CRS8K"
+
+[devices.fast_scanner.config]
+amplitude_control_channel = "Dev1/ao0"
+command_voltage_range = {min = "0 V", max = "5 V"}
+nominal_frequency = "7.91 kHz"
+max_amplitude = "26 deg"
+settling_time = "100 ms"
+frequency_tolerance = 0.003

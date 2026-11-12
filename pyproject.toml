@@ -21,6 +21,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "pytest-cov",
     "ruff==0.17.4",
     "ty==0.0.99",
 ]
@@ -30,7 +31,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers --import-mode=importlib"
+addopts = "-ra --strict-markers --cov=dirigo_nidaq --cov-report=term-missing --import-mode=importlib"
 markers = [
     "hardware: accesses physical equipment and requires --hardware",
 ]
@@ -49,3 +50,6 @@ select = [
 
 [tool.ty.environment]
 python-version = "3.14"
+
+[project.entry-points."dirigo.devices.scanners"]
+nidaq_resonant = "dirigo_nidaq.scanner:NIResonantScanner"

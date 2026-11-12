@@ -1,5 +1,3 @@
-"""Test flat NI resonant configuration without importing an NI SDK."""
-
 from dataclasses import replace
 from pathlib import Path
 
@@ -43,7 +41,8 @@ def test_loads_flat_toml_with_inherited_parameters(tmp_path: Path) -> None:
     path.write_text(
         """
         [devices.fast_scanner]
-        driver = "ni_resonant"
+        category = "scanners"
+        driver = "nidaq_resonant"
 
         [devices.fast_scanner.config]
         amplitude_control_channel = "Dev1/ao0"
@@ -55,7 +54,9 @@ def test_loads_flat_toml_with_inherited_parameters(tmp_path: Path) -> None:
         """,
         encoding="utf-8",
     )
-    hardware = load_hardware(path, drivers={"ni_resonant": ConfigOnlyDevice})
+    hardware = load_hardware(
+        path, drivers={"scanners": {"nidaq_resonant": ConfigOnlyDevice}}
+    )
 
     try:
         config = hardware.require("fast_scanner", ConfigOnlyDevice).config

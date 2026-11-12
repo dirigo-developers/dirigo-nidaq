@@ -1,5 +1,9 @@
-"""NI hardware implementations for Dirigo."""
+from dirigo_nidaq.scanner import (
+    NIResonantScanner,
+    NIResonantScannerConfig,
+)
 
-from .scanner import NIResonantScannerConfig
-
-__all__ = ["NIResonantScannerConfig"]
+__all__ = [
+    "NIResonantScanner",
+    "NIResonantScannerConfig",
+]
