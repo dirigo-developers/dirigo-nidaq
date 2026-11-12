@@ -7,7 +7,12 @@ import nidaqmx
 from dirigo import units
 from dirigo.hardware.analog import angle_voltage_coefficients
 from dirigo.hardware.metadata import DriverIdentity
-from dirigo.hardware.scanner import ResonantScanner, ResonantScannerConfig
+from dirigo.hardware.scanner import (
+    GalvoScanner,
+    GalvoScannerConfig,
+    ResonantScanner,
+    ResonantScannerConfig,
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -58,15 +63,17 @@ class NIResonantScannerConfig(ResonantScannerConfig):
 
 
 @contextmanager
-def _output_task(config: NIResonantScannerConfig) -> Generator[nidaqmx.Task]:
-    """Configure an AO task and release it when the operation finishes."""
+def _output_task(
+    channel: str,
+    command_voltage_range: units.VoltageRange,
+) -> Generator[nidaqmx.Task]:
+    """Own one scalar AO task and preserve operation errors during cleanup."""
     task = nidaqmx.Task()
-
     try:
         task.ao_channels.add_ao_voltage_chan(
-            physical_channel=config.amplitude_control_channel,
-            min_val=float(config.command_voltage_range.min),
-            max_val=float(config.command_voltage_range.max),
+            physical_channel=channel,
+            min_val=float(command_voltage_range.min),
+            max_val=float(command_voltage_range.max),
         )
         yield task
     except BaseException as failure:
@@ -114,9 +121,6 @@ class NIResonantScanner(ResonantScanner):
             config.command_voltage_range,
         )
 
-        with _output_task(config):
-            pass
-
     @property
     def config(self) -> NIResonantScannerConfig:
         """Physical scanner specifications and NI connection parameters."""
@@ -147,7 +151,10 @@ class NIResonantScanner(ResonantScanner):
             float(self.config.command_voltage_range.max),
         )
 
-        with _output_task(self.config) as task:
+        with _output_task(
+            self.config.amplitude_control_channel,
+            self.config.command_voltage_range,
+        ) as task:
             if task.write(voltage, auto_start=True) != 1:
                 raise RuntimeError("NI task did not accept exactly one sample.")
 
@@ -165,6 +172,138 @@ class NIResonantScanner(ResonantScanner):
                     "min": self.config.command_voltage_range.min,
                     "max": self.config.command_voltage_range.max,
                 },
+            }
+        )
+        return settings
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class NIGalvoScannerConfig(GalvoScannerConfig):
+    """Add NI connection and nominal voltage mapping to one galvo axis.
+
+    All fields remain in one configuration table. With inverted=False,
+    angle_range.min maps to command_voltage_range.min and angle_range.max
+    maps to command_voltage_range.max. Inversion swaps those voltage endpoints.
+
+    These are full-scale vendor specifications, independent of the angular
+    extent selected for a particular scan.
+    """
+
+    angle_control_channel: str = field(
+        metadata={
+            "description": "NI analog-output channel controlling optical angle.",
+        }
+    )
+    command_voltage_range: units.VoltageRange = field(
+        metadata={
+            "description": "Vendor-specified galvo command-voltage range.",
+            "display_unit": "V",
+        }
+    )
+    inverted: bool = field(
+        default=False,
+        metadata={
+            "description": "Reverse the nominal optical-angle-to-voltage mapping.",
+        },
+    )
+
+    def __post_init__(self) -> None:
+        """Validate inherited optical limits and the NI mapping parameters."""
+        GalvoScannerConfig.__post_init__(self)
+        if not isinstance(self.angle_control_channel, str):
+            raise TypeError("angle_control_channel must be a string.")
+        if not self.angle_control_channel.strip():
+            raise ValueError("angle_control_channel must not be blank.")
+        if not isinstance(self.inverted, bool):
+            raise TypeError("inverted must be a bool.")
+
+        angle_voltage_coefficients(
+            self.angle_range,
+            self.command_voltage_range,
+            inverted=self.inverted,
+        )
+
+
+class NIGalvoScanner(GalvoScanner):
+    """Command static optical angles through one NI analog-output channel.
+
+    Construction stores configuration and scaling without creating tasks.
+    Each static command creates, writes, and closes an on-demand task.
+    Timed grouped output is owned by a separate output session.
+
+    The base class enforces optical limits, reservations, and command history.
+    No settling wait or automatic parking command is applied.
+    """
+
+    config_type = NIGalvoScannerConfig
+
+    def __init__(self, config: NIGalvoScannerConfig) -> None:
+        """Store NI specifications without accessing hardware.
+
+        Raises:
+            TypeError: config is not an NIGalvoScannerConfig.
+        """
+        if not isinstance(config, NIGalvoScannerConfig):
+            raise TypeError("config must be an NIGalvoScannerConfig.")
+
+        super().__init__(config)
+        self._ni_config = config
+        self._gain, self._offset = angle_voltage_coefficients(
+            config.angle_range,
+            config.command_voltage_range,
+            inverted=config.inverted,
+        )
+
+    @property
+    def config(self) -> NIGalvoScannerConfig:
+        """Physical optical limits and NI connection parameters."""
+        return self._ni_config
+
+    @property
+    def driver_identity(self) -> DriverIdentity:
+        """Identify the implementation and installed driver distribution."""
+        try:
+            version = importlib_metadata.version("dirigo-nidaq")
+        except importlib_metadata.PackageNotFoundError:
+            version = None
+        return DriverIdentity(
+            implementation=super().driver_identity.implementation,
+            distribution="dirigo-nidaq",
+            version=version,
+        )
+
+    def _write_angle(self, value: units.Angle) -> None:
+        """Convert a validated static angle and write one voltage sample."""
+        voltage = float(value) * self._gain + self._offset
+
+        # Optical limits were already checked. Bound endpoint roundoff to
+        # the configured command-voltage interval.
+        voltage = min(
+            max(voltage, float(self.config.command_voltage_range.min)),
+            float(self.config.command_voltage_range.max),
+        )
+        with _output_task(
+            self.config.angle_control_channel,
+            self.config.command_voltage_range,
+        ) as task:
+            if task.write(voltage, auto_start=True) != 1:
+                raise RuntimeError("NI task did not accept exactly one sample.")
+
+    def _close(self) -> None:
+        """Release no persistent tasks and issue no parking command."""
+        return
+
+    def _snapshot_settings(self) -> dict[str, object]:
+        """Include connection, nominal voltage mapping, and inversion settings."""
+        settings = super()._snapshot_settings()
+        settings.update(
+            {
+                "angle_control_channel": self.config.angle_control_channel,
+                "command_voltage_range": {
+                    "min": self.config.command_voltage_range.min,
+                    "max": self.config.command_voltage_range.max,
+                },
+                "inverted": self.config.inverted,
             }
         )
         return settings

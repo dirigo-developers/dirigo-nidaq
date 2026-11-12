@@ -53,3 +53,4 @@ python-version = "3.14"
 
 [project.entry-points."dirigo.devices.scanners"]
 nidaq_resonant = "dirigo_nidaq.scanner:NIResonantScanner"
+nidaq_galvo = "dirigo_nidaq.scanner:NIGalvoScanner"

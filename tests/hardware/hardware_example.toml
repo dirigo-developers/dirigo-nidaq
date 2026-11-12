@@ -3,6 +3,7 @@ scanner = "fast_scanner"
 amplitude = "1 deg"
 final_amplitude = "0 deg"
 
+
 [devices.fast_scanner]
 category = "scanners"
 driver = "nidaq_resonant"
@@ -18,3 +19,40 @@ nominal_frequency = "7.91 kHz"
 max_amplitude = "26 deg"
 settling_time = "100 ms"
 frequency_tolerance = 0.003
+
+
+[test.galvo]
+sample_rate = "1 kS/s"
+timeout = "2 s"
+
+[[test.galvo.axes]]
+scanner = "galvo_x"
+samples = ["0 deg", "0.05 deg", "0.1 deg", "0.05 deg", "0 deg"]
+final_angle = "0 deg"
+
+[[test.galvo.axes]]
+scanner = "galvo_y"
+samples = ["0 deg", "-0.05 deg", "-0.1 deg", "-0.05 deg", "0 deg"]
+final_angle = "0 deg"
+
+
+[devices.galvo_x]
+category = "scanners"
+driver = "nidaq_galvo"
+
+[devices.galvo_x.config]
+angle_control_channel = "Dev1/ao1"
+angle_range = {min = "-10 deg", max = "10 deg"}
+command_voltage_range = {min = "-5 V", max = "5 V"}
+inverted = false
+
+
+[devices.galvo_y]
+category = "scanners"
+driver = "nidaq_galvo"
+
+[devices.galvo_y.config]
+angle_control_channel = "Dev1/ao2"
+angle_range = {min = "-10 deg", max = "10 deg"}
+command_voltage_range = {min = "-5 V", max = "5 V"}
+inverted = false
