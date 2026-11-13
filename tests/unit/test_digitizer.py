@@ -13,6 +13,7 @@ from dirigo.hardware.capture import CaptureSettings, SampleArray
 from dirigo.hardware.capture_session import CaptureState
 from dirigo.hardware.config import parse_config
 from dirigo.hardware.timing import (
+    DigitalRecordTrigger,
     DigitalStartTrigger,
     ExternalSampleClock,
     SignalEdge,
@@ -788,4 +789,21 @@ def test_invalid_reported_timing_fails_preparation(
         ni.task.close.assert_called_once_with()
     finally:
         session.close()
+        digitizer.close()
+
+
+def test_record_trigger_is_rejected_before_task_creation(ni: FakeNI) -> None:
+    """Reject per-record triggering instead of treating it as a run-start gate."""
+    digitizer = _device()
+    try:
+        with pytest.raises(NotImplementedError, match="record triggers"):
+            digitizer.create_capture(
+                replace(
+                    _settings(),
+                    record_trigger=DigitalRecordTrigger(source="external"),
+                )
+            )
+
+        ni.factory.assert_not_called()
+    finally:
         digitizer.close()

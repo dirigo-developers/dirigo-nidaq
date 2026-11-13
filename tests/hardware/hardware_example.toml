@@ -56,3 +56,27 @@ angle_control_channel = "Dev1/ao2"
 angle_range = {min = "-10 deg", max = "10 deg"}
 command_voltage_range = {min = "-5 V", max = "5 V"}
 inverted = false
+
+[devices.digitizer]
+category = "digitizers"
+driver = "nidaq"
+
+[devices.digitizer.config]
+physical_channels = "Dev1/ai0:1"
+
+
+[test.synchronized]
+digitizer = "digitizer"
+scanner = "galvo_x"
+
+sample_rate = "1 kS/s"
+record_length = 32
+records_per_batch = 2
+batch_count = 2
+channel_indices = [0, 1]
+input_voltage_range = {min = "-5 V", max = "5 V"}
+terminal_config = "DIFF"
+
+command_angle = "0 deg"
+final_angle = "0 deg"
+timeout = "2 s"

@@ -239,6 +239,10 @@ class NIDigitizer(Digitizer):
             raise NotImplementedError(
                 "NI timestamps currently require an internal sample clock."
             )
+        if settings.record_trigger is not None:
+            raise NotImplementedError(
+                "NI capture does not support record triggers yet."
+            )
 
         return NICaptureSession(self, settings)
 

@@ -17,7 +17,7 @@ jobs:
         working-directory: plugin
 
     steps:
-      - name: Check out NIDAQ plugin
+      - name: Check out dirigo-nidaq
         uses: actions/checkout@v7
         with:
           path: plugin
@@ -45,7 +45,7 @@ jobs:
       - name: Install Dirigo
         run: python -m pip install -e ../dirigo
 
-      - name: Install NIDAQ plugin and development dependencies
+      - name: Install dirigo-nidaq and development dependencies
         run: python -m pip install -e ".[dev]"
 
       - name: Check lint
@@ -57,5 +57,5 @@ jobs:
       - name: Check types
         run: ty check
 
-      - name: Run ordinary tests
+      - name: Run tests
         run: python -m pytest
