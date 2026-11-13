@@ -8,7 +8,11 @@ import numpy as np
 from dirigo.hardware.analog import angle_voltage_coefficients
 from dirigo.hardware.output import GalvoOutputSession
 from dirigo.hardware.scanner import GalvoScanner
-from dirigo.hardware.timing import ClockEdge, ExternalSampleClock
+from dirigo.hardware.timing import (
+    DigitalStartTrigger,
+    ExternalSampleClock,
+    SignalEdge,
+)
 from dirigo.hardware.waveform import AngularWaveform
 from nidaqmx import constants, errors, stream_writers
 
@@ -16,9 +20,9 @@ from dirigo_nidaq.scanner import NIGalvoScanner
 
 _WAIT_UNTIL_DONE_TIMEOUT = -200560
 
-_NI_CLOCK_EDGES = {
-    ClockEdge.RISING: constants.Edge.RISING,
-    ClockEdge.FALLING: constants.Edge.FALLING,
+_NI_SIGNAL_EDGES = {
+    SignalEdge.RISING: constants.Edge.RISING,
+    SignalEdge.FALLING: constants.Edge.FALLING,
 }
 
 
@@ -37,6 +41,9 @@ class NIGalvoOutputSession(GalvoOutputSession):
     Closing releases the task without issuing a static or parking command.
     Sample-rate coercion and device capabilities remain the NI driver's
     responsibility.
+
+    With start_trigger configured, start() arms the task and returns. wait()
+    observes completion, including any time spent awaiting that trigger.
     """
 
     def __init__(
@@ -44,9 +51,12 @@ class NIGalvoOutputSession(GalvoOutputSession):
         waveforms: Mapping[GalvoScanner, AngularWaveform],
         *,
         external_clock: ExternalSampleClock | None = None,
+        start_trigger: DigitalStartTrigger | None = None,
     ) -> None:
         """Validate waveforms, clock selection, and channels without a task."""
-        super().__init__(waveforms, external_clock=external_clock)
+        super().__init__(
+            waveforms, external_clock=external_clock, start_trigger=start_trigger
+        )
 
         axes: list[NIGalvoScanner] = []
         channels: set[tuple[str, int]] = set()
@@ -116,12 +126,19 @@ class NIGalvoOutputSession(GalvoOutputSession):
         task.timing.cfg_samp_clk_timing(
             rate=float(self._sample_rate if clock is None else clock.max_rate),
             source="" if clock is None else clock.source,
-            active_edge=_NI_CLOCK_EDGES[
-                ClockEdge.RISING if clock is None else clock.active_edge
+            active_edge=_NI_SIGNAL_EDGES[
+                SignalEdge.RISING if clock is None else clock.active_edge
             ],
             sample_mode=constants.AcquisitionType.FINITE,
             samps_per_chan=self._sample_count,
         )
+
+        trigger = self.start_trigger
+        if trigger is not None:
+            task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                trigger_source=trigger.source,
+                trigger_edge=_NI_SIGNAL_EDGES[trigger.active_edge],
+            )
 
         writer = stream_writers.AnalogMultiChannelWriter(
             task.out_stream, auto_start=False
@@ -136,7 +153,7 @@ class NIGalvoOutputSession(GalvoOutputSession):
         return self._task
 
     def _start_output(self) -> None:
-        """Start the preloaded task using the selected sample clock."""
+        """Start or arm the preloaded task without waiting for a trigger."""
         self._require_task().start()
 
     def _wait_output(self, timeout: float | None) -> bool:

@@ -11,7 +11,7 @@ from dirigo import units
 from dirigo.hardware.output import OutputState
 from dirigo.hardware.scanner import GalvoScannerConfig
 from dirigo.hardware.simulated import SimulatedGalvoScanner
-from dirigo.hardware.timing import ClockEdge, ExternalSampleClock
+from dirigo.hardware.timing import DigitalStartTrigger, ExternalSampleClock, SignalEdge
 from dirigo.hardware.waveform import AngularWaveform
 from nidaqmx import constants, errors, stream_writers
 
@@ -108,6 +108,7 @@ def test_prepare_preserves_channel_order_and_converts_each_axis(
     try:
         session.prepare()
 
+        ni.task.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
         assert session.state is OutputState.PREPARED
         ni.task_factory.assert_called_once_with()
         assert ni.task.ao_channels.add_ao_voltage_chan.call_args_list == [
@@ -291,7 +292,8 @@ def test_non_ni_scanner_is_rejected_without_a_task(ni: FakeNI) -> None:
 
 
 @pytest.mark.parametrize(
-    "stage", ["channel", "timing", "writer", "preload", "start", "wait", "stop"]
+    "stage",
+    ["channel", "timing", "trigger", "writer", "preload", "start", "wait", "stop"],
 )
 @pytest.mark.parametrize("cleanup_fails", [False, True])
 def test_native_failure_closes_task_and_releases_scanner(
@@ -309,6 +311,7 @@ def test_native_failure_closes_task_and_releases_scanner(
     operations = {
         "channel": ni.task.ao_channels.add_ao_voltage_chan,
         "timing": ni.task.timing.cfg_samp_clk_timing,
+        "trigger": ni.task.triggers.start_trigger.cfg_dig_edge_start_trig,
         "writer": ni.writer_factory,
         "preload": ni.writer.write_many_sample,
         "start": ni.task.start,
@@ -321,7 +324,12 @@ def test_native_failure_closes_task_and_releases_scanner(
         ni.task.close.side_effect = RuntimeError("Cleanup failed.")
 
     axis = axes[0]
-    session = NIGalvoOutputSession({axis: _waveform(0, 1, 2)})
+    session = NIGalvoOutputSession(
+        {axis: _waveform(0, 1, 2)},
+        start_trigger=(
+            DigitalStartTrigger(source="/Dev1/PFI1") if stage == "trigger" else None
+        ),
+    )
     action: Callable[[], object] = session.prepare
     if stage in ("start", "wait", "stop"):
         session.prepare()
@@ -437,8 +445,8 @@ def external_clock() -> ExternalSampleClock:
 @pytest.mark.parametrize(
     ("edge", "ni_edge"),
     [
-        (ClockEdge.RISING, constants.Edge.RISING),
-        (ClockEdge.FALLING, constants.Edge.FALLING),
+        (SignalEdge.RISING, constants.Edge.RISING),
+        (SignalEdge.FALLING, constants.Edge.FALLING),
     ],
 )
 @pytest.mark.parametrize("max_rate", [1000.0, 1200.0])
@@ -446,7 +454,7 @@ def test_external_clock_is_forwarded_during_prepare(
     axes: tuple[NIGalvoScanner, NIGalvoScanner],
     external_clock: ExternalSampleClock,
     ni: FakeNI,
-    edge: ClockEdge,
+    edge: SignalEdge,
     ni_edge: constants.Edge,
     max_rate: float,
 ) -> None:
@@ -507,5 +515,98 @@ def test_external_clock_timeout_keeps_session_started(
         session.close()
 
     ni.task.stop.assert_called_once_with()
+    ni.task.close.assert_called_once_with()
+    axes[0].close()
+
+
+@pytest.mark.parametrize("use_external_clock", [False, True])
+@pytest.mark.parametrize(
+    ("edge", "ni_edge"),
+    [
+        (SignalEdge.RISING, constants.Edge.RISING),
+        (SignalEdge.FALLING, constants.Edge.FALLING),
+    ],
+)
+def test_start_trigger_is_configured_before_arming(
+    axes: tuple[NIGalvoScanner, NIGalvoScanner],
+    external_clock: ExternalSampleClock,
+    ni: FakeNI,
+    edge: SignalEdge,
+    ni_edge: constants.Edge,
+    use_external_clock: bool,
+) -> None:
+    """Translate trigger edges independently of the selected sample clock.
+
+    Preparation configures the digital trigger and preloads samples without
+    starting. start() delegates to NI start without performing a completion
+    wait. Closing this unfinished session must stop and release the task.
+    """
+    trigger = DigitalStartTrigger(source="/Dev1/PFI1", active_edge=edge)
+    session = NIGalvoOutputSession(
+        {axes[0]: _waveform(0, 1, 2)},
+        external_clock=external_clock if use_external_clock else None,
+        start_trigger=trigger,
+    )
+    try:
+        assert session.start_trigger is trigger
+        ni.task_factory.assert_not_called()
+        session.prepare()
+
+        ni.task.triggers.start_trigger.cfg_dig_edge_start_trig.assert_called_once_with(
+            trigger_source="/Dev1/PFI1", trigger_edge=ni_edge
+        )
+        ni.writer_factory.assert_called_once_with(ni.task.out_stream, auto_start=False)
+        ni.task.start.assert_not_called()
+
+        session.start()
+        assert session.state is OutputState.STARTED
+        ni.task.start.assert_called_once_with()
+        ni.task.wait_until_done.assert_not_called()
+    finally:
+        session.close()
+
+    ni.task.stop.assert_called_once_with()
+    ni.task.close.assert_called_once_with()
+    axes[0].close()
+
+
+@pytest.mark.parametrize("complete_later", [False, True])
+def test_trigger_timeout_allows_completion_or_cancellation(
+    axes: tuple[NIGalvoScanner, NIGalvoScanner],
+    ni: FakeNI,
+    complete_later: bool,
+) -> None:
+    """Retain an armed run after timeout, then complete it or cancel on close.
+
+    Mock NI reporting incomplete output followed by completion. If the caller
+    instead closes after the timeout, the adapter must stop the unfinished
+    task. The scanner reservation is released in either case.
+    """
+    session = NIGalvoOutputSession(
+        {axes[0]: _waveform(0, 1, 2)},
+        start_trigger=DigitalStartTrigger(source="/Dev1/PFI1"),
+    )
+    ni.task.wait_until_done.side_effect = [
+        errors.DaqError("Not done yet.", -200560),
+        None,
+    ]
+    try:
+        session.prepare()
+        session.start()
+        assert not session.wait(timeout=0.25)
+        assert session.state is OutputState.STARTED
+        ni.task.stop.assert_not_called()
+        ni.task.close.assert_not_called()
+
+        if complete_later:
+            assert session.wait(timeout=0.25)
+            assert session.state is OutputState.COMPLETED
+    finally:
+        session.close()
+
+    if complete_later:
+        ni.task.stop.assert_not_called()
+    else:
+        ni.task.stop.assert_called_once_with()
     ni.task.close.assert_called_once_with()
     axes[0].close()
