@@ -80,3 +80,31 @@ terminal_config = "DIFF"
 command_angle = "0 deg"
 final_angle = "0 deg"
 timeout = "2 s"
+
+
+# Supply running TTL record triggers at the Alazar external-trigger input.
+# Connect its software-configurable AUX output to the NI input named below.
+# The test selects acquisition-active AUX output and holds a constant angle.
+
+[test.triggered_frame]
+digitizer = "alazar_digitizer"
+scanner = "galvo_x"
+acquisition_active_input = "/Dev1/PFI0"
+
+sample_rate = "100 MS/s"
+record_length = 4096
+records_per_batch = 2
+batch_count = 4
+channel_indices = [0, 1]
+input_voltage_range = {min = "-1 V", max = "1 V"}
+input_impedance = "50 ohm"
+input_coupling = "DC"
+trigger_edge = "rising"
+dma_buffer_count = 4
+
+ao_sample_rate = "20 kS/s"
+ao_sample_count = 100
+command_angle = "0 deg"
+final_angle = "0 deg"
+settling_time = "100 ms"
+timeout = "5 s"
