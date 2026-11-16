@@ -140,11 +140,16 @@ class NIGalvoOutputSession(GalvoOutputSession):
                 trigger_edge=_NI_SIGNAL_EDGES[trigger.active_edge],
             )
 
+        self._configure_output_task(task)
         writer = stream_writers.AnalogMultiChannelWriter(
             task.out_stream, auto_start=False
         )
         if writer.write_many_sample(samples) != self._sample_count:
             raise RuntimeError("NI task did not accept every sample per channel.")
+
+    def _configure_output_task(self, task: nidaqmx.Task) -> None:
+        """Allow subclasses to specialize the configured task before preloading."""
+        return
 
     def _require_task(self) -> nidaqmx.Task:
         """Return the prepared task or reject an internal lifecycle error."""
