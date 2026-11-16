@@ -23,9 +23,9 @@ from dirigo.hardware.simulated_digitizer import (
     SimulatedDigitizer,
     SimulatedDigitizerConfig,
 )
-from dirigo.hardware.timing import DigitalStartTrigger, ExternalSampleClock, SignalEdge
+from dirigo.hardware.timing import ExternalSampleClock
 from dirigo.hardware.waveform import AngularWaveform
-from nidaqmx import constants, errors, stream_writers
+from nidaqmx import stream_writers
 
 from dirigo_nidaq import retriggered_output as output_module
 from dirigo_nidaq import triggered_sequence as sequence_module
@@ -75,11 +75,8 @@ class Rig:
     sequences: list[NITriggeredFrameSequence] = field(default_factory=list)
     pending: list[Mock] = field(default_factory=list)
     created: list[Mock] = field(default_factory=list)
-    clock_waits: list[float] = field(default_factory=list)
-    clock_complete: bool = True
     generated: int = 40
     capture_cost: float = 0.0
-    clock_cost: float = 0.0
 
 
 def _step(rig: Rig, event: str) -> None:
@@ -129,10 +126,10 @@ def rig(monkeypatch: pytest.MonkeyPatch) -> Iterator[Rig]:
             capture_settings=DriverSettings(
                 sample_rate=units.SampleRate("100 MS/s"),
                 record_length=4,
-                records_per_batch=2,
+                records_per_batch=4,
                 batch_count=3,
             ),
-            records_per_frame=3,
+            records_per_frame=6,
         ),
         monkeypatch=monkeypatch,
         timer=timer,
@@ -199,39 +196,33 @@ def _sequence(rig: Rig) -> NITriggeredFrameSequence:
     """Create a fresh run and queue its clock/AO tasks for later preparation."""
     clock = Mock()
     output = Mock()
-    clock.do_channels.add_do_chan.side_effect = lambda **_: _step(rig, "clock.prepare")
+
+    def configure_counter(**parameters: object) -> Mock:
+        """Record counter setup and echo timing for the post-commit checks."""
+        _step(rig, "clock.prepare")
+        channel = Mock()
+        channel.co_pulse_ticks_initial_delay = parameters["initial_delay"]
+        channel.co_pulse_high_ticks = parameters["high_ticks"]
+        channel.co_pulse_low_ticks = parameters["low_ticks"]
+        return channel
+
+    clock.co_channels.add_co_pulse_chan_ticks.side_effect = configure_counter
     output.ao_channels.add_ao_voltage_chan.side_effect = lambda **_: _step(
         rig, "ao.prepare"
     )
-
-    def write_clock(data: object, *, auto_start: bool) -> int:
-        """Acknowledge the initial level or every buffered record-clock sample."""
-        return data.size if isinstance(data, np.ndarray) else 1
-
-    clock.write.side_effect = write_clock
     clock.start.side_effect = partial(_step, rig, "clock.start")
     output.start.side_effect = partial(_step, rig, "ao.start")
-    clock.stop.side_effect = lambda: _step(
-        rig, "clock.stop" if clock.start.called else "clock.idle_stop"
-    )
+    clock.stop.side_effect = partial(_step, rig, "clock.stop")
     output.stop.side_effect = partial(_step, rig, "ao.stop")
     clock.close.side_effect = partial(_step, rig, "clock.close")
     output.close.side_effect = partial(_step, rig, "ao.close")
-
-    def wait_clock(*, timeout: float) -> None:
-        """Report bounded clock timeout or completion after simulated elapsed time."""
-        _step(rig, "clock.wait")
-        rig.clock_waits.append(timeout)
-        rig.timer.now += rig.clock_cost
-        if not rig.clock_complete:
-            raise errors.DaqError("record edges still missing", -200560)
 
     def poll_output() -> bool:
         """Surface native AO errors while leaving retriggering armed."""
         _step(rig, "ao.wait")
         return False
 
-    clock.wait_until_done.side_effect = wait_clock
+    clock.wait_until_done.side_effect = AssertionError("Must not await counter")
     output.is_task_done.side_effect = poll_output
     rig.monkeypatch.setattr(
         type(output.out_stream),
@@ -251,8 +242,7 @@ def _sequence(rig: Rig) -> NITriggeredFrameSequence:
         record_clock=ExternalSampleClock(
             source="/Dev1/PFI0", max_rate=units.SampleRate("8 kS/s")
         ),
-        frame_clock_channel="Dev1/port0/line0",
-        frame_trigger=DigitalStartTrigger(source="/Dev1/PFI1"),
+        frame_counter_channel="Dev1/ctr0",
     )
     rig.sequences.append(sequence)
     return sequence
@@ -285,25 +275,25 @@ def test_construction_is_passive_and_uses_the_plan_request(rig: Rig) -> None:
 
 
 def test_prepare_start_and_close_follow_dependency_order(rig: Rig) -> None:
-    """Establish a low frame line before arming AO, then enable capture last.
+    """Commit a counter and arm AO before enabling acquired-record events.
 
-    The ADC and AO grids deliberately differ. Six records form two frames
+    The ADC and AO grids deliberately differ. Twelve records form two frames
     across three transfer batches, while AO preloads only one twenty-sample
-    frame. Normal cleanup disarms AO before stopping the clock or capture.
+    frame. AO receives the counter's internal signal without a PFI jumper.
+    Normal cleanup disarms AO before stopping the clock or capture.
     """
     sequence = _sequence(rig)
     sequence.prepare()
-    assert rig.events == [
-        "capture.prepare",
-        "clock.prepare",
-        "clock.idle_stop",
-        "ao.prepare",
-    ]
-    assert sequence.layout.shape == (2, 4, 1)
+    assert rig.events == ["capture.prepare", "clock.prepare", "ao.prepare"]
+    assert sequence.layout.shape == (4, 4, 1)
     clock, output = rig.created
-    np.testing.assert_array_equal(
-        clock.write.call_args_list[1].args[0], [True, False, False, True, False, False]
+    counter_arguments = clock.co_channels.add_co_pulse_chan_ticks.call_args.kwargs
+    trigger_arguments = (
+        output.triggers.start_trigger.cfg_dig_edge_start_trig.call_args.kwargs
     )
+    assert counter_arguments["initial_delay"] == 0
+    assert trigger_arguments["trigger_source"] == "/Dev1/Ctr0InternalOutput"
+    clock.write.assert_not_called()
     assert rig.writer.write_many_sample.call_args.args[0].shape == (1, 20)
     sequence.start()
     assert rig.events[-3:] == ["ao.start", "clock.start", "capture.start"]
@@ -319,85 +309,132 @@ def test_prepare_start_and_close_follow_dependency_order(rig: Rig) -> None:
     clock.close.assert_called_once_with()
     output.close.assert_called_once_with()
     assert rig.axis.angle is None
-    assert sequence.layout.shape == (2, 4, 1)
+    assert sequence.layout.shape == (4, 4, 1)
     _sequence(rig).prepare()
 
 
-def test_eof_requires_both_outputs_without_redelivering_batches(rig: Rig) -> None:
-    """Retry clock and AO completion independently after capture is exhausted.
+def test_eof_waits_for_ao_then_stops_clock_without_redelivering_batches(
+    rig: Rig,
+) -> None:
+    """Complete capture and AO before stopping the continuous counter.
 
-    Frame boundaries cross transfer batches. First the frame clock times out,
-    then AO remains incomplete, then both complete. None of these EOF retries
-    may overwrite the last batch, restart children, or deliver duplicate data.
+    Frame boundaries cross transfer batches. After capture EOF, incomplete AO
+    makes the read retryable while leaving the counter armed. Once all AO
+    samples are generated, EOF stops the counter without native waiting.
+    Retries must not overwrite or redeliver the last batch, restart children,
+    or repeat the counter stop.
     """
     sequence = _sequence(rig)
     sequence.prepare()
     sequence.start()
+    clock, output = rig.created
+
     samples = np.empty(sequence.layout.shape, dtype=sequence.layout.dtype)
-    delivered = []
+    delivered: list[SampleArray] = []
+    rig.generated = 0
+
     for _ in range(3):
         assert sequence.read_into(samples, timeout=0) is not None
         delivered.append(samples.copy())
-    expected = (np.arange(24, dtype=np.int32) - 32768).astype(np.int16).reshape(6, 4, 1)
+
+    expected = (
+        (np.arange(48, dtype=np.int32) - 32768).astype(np.int16).reshape(12, 4, 1)
+    )
     np.testing.assert_array_equal(np.concatenate(delivered), expected)
     last = samples.copy()
-    rig.clock_complete = False
-    rig.generated = 0
-    with pytest.raises(TimeoutError, match="frame clock"):
-        sequence.read_into(samples, timeout=0)
-    assert "ao.wait" not in rig.events
-    rig.clock_complete = True
+
     with pytest.raises(TimeoutError, match="AO output"):
         sequence.read_into(samples, timeout=0)
+
     assert sequence.state is CaptureState.STARTED
+    clock.stop.assert_not_called()
+    output.stop.assert_not_called()
+
     rig.generated = 40
+
     assert sequence.read_into(samples, timeout=0) is None
     assert sequence.state is CaptureState.COMPLETED
+    assert rig.events[-2:] == ["ao.stop", "clock.stop"]
+
     events = rig.events.copy()
     assert sequence.read_into(samples, timeout=0) is None
     assert rig.events == events
     assert rig.events.count("capture.read") == 3
-    assert len(rig.clock_waits) == 2
     assert sequence.batches_acquired == 3
     np.testing.assert_array_equal(samples, last)
+
     with pytest.raises(ValueError, match="shape"):
-        sequence.read_into(np.empty((1,), dtype=sequence.layout.dtype), timeout=0)
+        sequence.read_into(
+            np.empty((1,), dtype=sequence.layout.dtype),
+            timeout=0,
+        )
+
     with pytest.raises(ValueError, match="timeout"):
         sequence.read_into(samples, timeout=float("nan"))
+
     assert sequence.state is CaptureState.COMPLETED
 
+    sequence.close()
 
-def test_eof_waits_share_one_deadline(rig: Rig) -> None:
-    """Subtract capture overhead and clock waiting before giving AO its budget."""
+    clock.start.assert_called_once_with()
+    output.start.assert_called_once_with()
+    clock.stop.assert_called_once_with()
+    clock.wait_until_done.assert_not_called()
+    clock.close.assert_called_once_with()
+    output.close.assert_called_once_with()
+
+
+def test_eof_ao_wait_uses_budget_remaining_after_capture(
+    rig: Rig,
+) -> None:
+    """Subtract capture overhead before giving AO the remaining timeout budget.
+
+    Capture uses 0.125 seconds of the 0.5-second budget. Incomplete AO consumes
+    the remaining 0.375 seconds while the counter stays armed. A later
+    zero-timeout poll can observe AO completion and stop the counter.
+    """
     sequence = _sequence(rig)
     sequence.prepare()
     sequence.start()
     samples = _drain(sequence)
+
     rig.capture_cost = 0.125
-    rig.clock_cost = 0.25
     rig.generated = 0
+
     with pytest.raises(TimeoutError, match="AO output"):
         sequence.read_into(samples, timeout=0.5)
-    assert rig.clock_waits == [0.375]
+
     assert rig.timer.now == 0.5
-    assert abs(rig.timer.slept - 0.125) < 1e-12
-    rig.capture_cost = rig.clock_cost = 0.0
+    assert abs(rig.timer.slept - 0.375) < 1e-12
+    rig.created[0].stop.assert_not_called()
+
+    rig.capture_cost = 0.0
     rig.generated = 40
+
     assert sequence.read_into(samples, timeout=0) is None
 
 
 @pytest.mark.parametrize("timeout", [None, 0.0625])
 def test_unbounded_budget_or_exhausted_budget_can_observe_completion(
-    rig: Rig, timeout: float | None
+    rig: Rig,
+    timeout: float | None,
 ) -> None:
-    """Forward unbounded waiting or poll both outputs after capture uses the budget."""
+    """Finish AO and stop the counter with an unbounded or exhausted budget.
+
+    AO has already generated every expected sample. Even if capture consumes
+    the bounded budget, a zero-timeout AO poll can observe completion without
+    sleeping. Counter shutdown must not invoke native completion waiting.
+    """
     sequence = _sequence(rig)
     sequence.prepare()
     sequence.start()
     samples = _drain(sequence)
+
     rig.capture_cost = 0.125
+
     assert sequence.read_into(samples, timeout=timeout) is None
-    assert rig.clock_waits == [constants.WAIT_INFINITELY if timeout is None else 0.0]
+    rig.created[0].wait_until_done.assert_not_called()
+    rig.created[0].stop.assert_called_once_with()
     assert rig.timer.slept == 0
 
 
@@ -429,7 +466,7 @@ def test_capture_timeout_and_argument_errors_preserve_usability(rig: Rig) -> Non
         "clock.start",
         "capture.start",
         "capture.read",
-        "clock.wait",
+        "clock.stop",
         "ao.wait",
     ],
 )
@@ -443,12 +480,15 @@ def test_fatal_child_failure_closes_every_session(rig: Rig, stage: str) -> None:
     sequence = _sequence(rig)
     if not stage.endswith("prepare"):
         sequence.prepare()
-    if stage in {"capture.read", "clock.wait", "ao.wait"}:
+    if stage in {"capture.read", "clock.stop", "ao.wait"}:
         sequence.start()
         samples = (
             _drain(sequence)
-            if stage.endswith("wait")
-            else np.empty(sequence.layout.shape, dtype=sequence.layout.dtype)
+            if stage != "capture.read"
+            else np.empty(
+                sequence.layout.shape,
+                dtype=sequence.layout.dtype,
+            )
         )
         operation: Callable[[], object] = partial(
             sequence.read_into, samples, timeout=0
@@ -462,6 +502,9 @@ def test_fatal_child_failure_closes_every_session(rig: Rig, stage: str) -> None:
     assert caught.value is failure
     assert sequence.state is CaptureState.CLOSED
     assert rig.captures[0].state is CaptureState.CLOSED
+    if stage == "clock.stop":
+        rig.created[0].stop.assert_called_once_with()
+        assert "ao.stop" in rig.events
     for task in rig.created:
         task.close.assert_called_once_with()
     rig.failures.clear()
@@ -547,22 +590,14 @@ def test_out_of_order_lifecycle_calls_are_rejected(rig: Rig) -> None:
 
 @pytest.mark.parametrize(
     "invalid",
-    ["digitizer", "plan", "trigger", "edge", "clock", "channel", "frames", "waveforms"],
+    ["digitizer", "plan", "clock", "counter", "frames", "waveforms"],
 )
 def test_constructor_rejects_invalid_inputs_without_hardware(
     rig: Rig, invalid: str
 ) -> None:
     """Validate coordinator and child arguments before constructing a capture."""
-    trigger = DigitalStartTrigger(
-        source="/Dev1/PFI1",
-        active_edge=SignalEdge.FALLING if invalid == "edge" else SignalEdge.RISING,
-    )
     plan = replace(rig.plan, records_per_frame=1) if invalid == "frames" else rig.plan
-    expected = (
-        TypeError
-        if invalid in {"digitizer", "plan", "trigger", "clock"}
-        else ValueError
-    )
+    expected = TypeError if invalid in {"digitizer", "plan", "clock"} else ValueError
     waveform = AngularWaveform([0.0] * 20, sample_rate=units.SampleRate("20 kS/s"))
     clock = ExternalSampleClock(
         source="/Dev1/PFI0", max_rate=units.SampleRate("8 kS/s")
@@ -575,17 +610,14 @@ def test_constructor_rejects_invalid_inputs_without_hardware(
             record_clock=(
                 cast(ExternalSampleClock, object()) if invalid == "clock" else clock
             ),
-            frame_clock_channel="bad" if invalid == "channel" else "Dev1/port0/line0",
-            frame_trigger=(
-                cast(DigitalStartTrigger, object()) if invalid == "trigger" else trigger
-            ),
+            frame_counter_channel="bad" if invalid == "counter" else "Dev1/ctr0",
         )
     assert rig.requests == []
     rig.factory.assert_not_called()
 
 
 def test_unexpected_prepared_record_batching_is_rejected(rig: Rig) -> None:
-    """Reject an effective record count inconsistent with the digital frame plan."""
+    """Reject an effective record count inconsistent with the counter frame plan."""
     sequence = _sequence(rig)
     rig.monkeypatch.setattr(
         rig.captures[0],

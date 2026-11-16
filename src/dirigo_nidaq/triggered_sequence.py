@@ -8,7 +8,7 @@ from dirigo.hardware.capture_session import CaptureState
 from dirigo.hardware.digitizer import Digitizer
 from dirigo.hardware.frame_plan import RecordFramePlan
 from dirigo.hardware.scanner import GalvoScanner
-from dirigo.hardware.timing import DigitalStartTrigger, ExternalSampleClock, SignalEdge
+from dirigo.hardware.timing import ExternalSampleClock
 from dirigo.hardware.waveform import AngularWaveform
 
 from dirigo_nidaq.frame_clock import NIFrameClockSession
@@ -40,28 +40,39 @@ class NITriggeredFrameSequence:
     settings subclasses. Construction accesses no hardware or reservations.
 
     record_clock names the NI input receiving one active edge per acquired
-    record. frame_clock_channel names the Port 0 output generating frame
-    pulses. Wire that output to frame_trigger.source, the rising-edge AO
-    trigger input. Signals must remain quiet until capture starts. For Alazar,
+    record. frame_counter_channel selects the counter generating frame pulses.
+    AO uses its CtrNInternalOutput signal, with no physical jumper on the same
+    NI device. frame_clock_export_terminal optionally also exports the pulses.
+    The record-clock source must remain quiet until capture starts. For Alazar,
     configure acquisition-active AUX output in the capture settings; this
     coordinator neither imports Alazar nor configures that connection itself.
 
-    Each waveform describes one frame. AO uses its own onboard sample clock;
-    no equality with the ADC sample grid is required. The caller plans phase,
-    waveform duration, and rearm margin, positions axes, and allows settling.
-    The coordinator does not start or set the amplitude of a resonant scanner.
+    The counter requests zero initial delay and permits NI's hardware minimum.
+    A PCIe-6323 has reported two record-clock ticks after committing that
+    request. First-pulse phase is not inferred from logical record indices.
+    Downstream frame processing accounts for line alignment and galvo response
+    delay; this coordinator has no adjustable alignment offset.
 
-    prepare() prepares capture, drives the frame-clock output low and preloads
-    its pattern, then prepares AO. start() arms AO, arms the frame clock, then
-    starts capture. Transfer batches and frame boundaries may cross.
+    Each waveform describes one frame. AO uses its own onboard sample clock;
+    no equality with the ADC sample grid is required. The caller plans waveform
+    duration and rearm margin, positions axes, and allows settling. The
+    coordinator does not start or set the amplitude of a resonant scanner.
+
+    prepare() prepares capture, commits the idle-low counter, then prepares
+    AO. start() arms AO, arms the frame clock, then starts capture. Transfer
+    batches and frame boundaries may cross.
 
     read_into() delivers complete batches. It returns None only after capture
-    EOF, frame-clock completion, and every expected AO frame. Each read uses
-    one total timeout budget. Timeouts and caller argument errors retain
-    usability; fatal child failures close all three sessions. stop() retains
-    resources until close(). Cleanup attempts AO first, then frame clock,
-    then capture, without closing devices or issuing parking commands.
-    Call methods serially and use bounded reads for cooperative cancellation.
+    EOF, every expected AO frame, and successful explicit frame-clock stop.
+    The frame counter runs continuously and is never awaited for completion.
+    The record-clock source must remain quiet after capture finishes.
+
+    Capture reading and AO waiting share one timeout budget. Timeouts and
+    caller argument errors retain usability; fatal child failures close all
+    three sessions. stop() retains resources until close(). Cleanup attempts
+    AO first, then frame clock, then capture, without closing devices or
+    issuing parking commands. Call methods serially and use bounded reads
+    for cooperative cancellation.
     """
 
     def __init__(
@@ -71,27 +82,23 @@ class NITriggeredFrameSequence:
         waveforms: Mapping[GalvoScanner, AngularWaveform],
         *,
         record_clock: ExternalSampleClock,
-        frame_clock_channel: str,
-        frame_trigger: DigitalStartTrigger,
+        frame_counter_channel: str,
+        frame_clock_export_terminal: str | None = None,
     ) -> None:
         """Validate connections and create owned sessions without hardware calls."""
         if not isinstance(digitizer, Digitizer):
             raise TypeError("digitizer must be a Digitizer.")
         if not isinstance(plan, RecordFramePlan):
             raise TypeError("plan must be a RecordFramePlan.")
-        if not isinstance(frame_trigger, DigitalStartTrigger):
-            raise TypeError("frame_trigger must be a DigitalStartTrigger.")
-        if frame_trigger.active_edge is not SignalEdge.RISING:
-            raise ValueError("frame_trigger must select the rising edge.")
-
         clock = NIFrameClockSession(
             plan,
-            output_channel=frame_clock_channel,
+            counter_channel=frame_counter_channel,
             record_clock=record_clock,
+            export_terminal=frame_clock_export_terminal,
         )
         output = NIRetriggeredGalvoOutputSession(
             waveforms,
-            start_trigger=frame_trigger,
+            start_trigger=clock.trigger,
             frame_count=plan.frame_count,
         )
         capture = digitizer.create_capture(plan.capture_settings)
@@ -103,7 +110,7 @@ class NITriggeredFrameSequence:
 
     @property
     def state(self) -> CaptureState:
-        """Sequence state; COMPLETED includes both NI output completions."""
+        """Sequence state; COMPLETED includes AO completion and counter stop."""
         return self._state
 
     @property
@@ -155,15 +162,22 @@ class NITriggeredFrameSequence:
     def read_into(
         self, destination: SampleArray, *, timeout: float | None = None
     ) -> CaptureInfo | None:
-        """Deliver a batch or observe all three completions before returning EOF.
+        """Deliver a batch or finish AO and stop the frame counter before EOF.
 
         Capture validates destination and timeout even on repeated EOF.
-        Completing a transfer batch does not establish frame completion.
-        An EOF timeout is retryable without redelivering the last batch or
-        restarting any child. None permits an unbounded total wait.
+        Completing a transfer batch does not establish AO completion.
+
+        An AO timeout is retryable without redelivering the last batch or
+        restarting any child. The counter remains armed while AO is incomplete;
+        its record-clock source must be quiet after capture finishes.
+
+        Counter stop failure closes every child and prevents successful EOF.
+        None permits an unbounded AO wait. The timeout does not bound native
+        cleanup calls.
         """
         if self._state is not CaptureState.COMPLETED:
             self._require_state(CaptureState.STARTED)
+
         started = monotonic()
         try:
             info = self._capture.read_into(destination, timeout=timeout)
@@ -171,22 +185,30 @@ class NITriggeredFrameSequence:
             if self._capture.state is CaptureState.CLOSED:
                 self._close_after_failure(failure)
             raise
+
         if info is not None or self._state is CaptureState.COMPLETED:
             return info
 
-        for child, label in ((self._clock, "frame clock"), (self._output, "AO output")):
-            remaining = (
-                None
-                if timeout is None
-                else max(0.0, float(timeout) - (monotonic() - started))
-            )
-            try:
-                complete = child.wait(timeout=remaining)
-            except BaseException as failure:
-                self._close_after_failure(failure)
-                raise
-            if not complete:
-                raise TimeoutError(f"Sequence {label} has not completed.")
+        remaining = (
+            None
+            if timeout is None
+            else max(0.0, float(timeout) - (monotonic() - started))
+        )
+        try:
+            complete = self._output.wait(timeout=remaining)
+        except BaseException as failure:
+            self._close_after_failure(failure)
+            raise
+
+        if not complete:
+            raise TimeoutError("Sequence AO output has not completed.")
+
+        try:
+            self._clock.stop()
+        except BaseException as failure:
+            self._close_after_failure(failure)
+            raise
+
         self._state = CaptureState.COMPLETED
         return None
 

@@ -17,7 +17,6 @@ from dirigo.hardware.digitizer import Digitizer
 from dirigo.hardware.frame_plan import RecordFramePlan
 from dirigo.hardware.timing import (
     DigitalRecordTrigger,
-    DigitalStartTrigger,
     ExternalSampleClock,
     SignalEdge,
 )
@@ -33,9 +32,9 @@ def test_alazar_triggered_frame_sequence() -> None:
 
     Read [test.triggered_sequence] from hardware_local.toml. The operator
     supplies running TTL record triggers to Alazar. Connect its configurable
-    acquisition-active AUX output to record_clock_input, then connect NI
-    frame_clock_output to frame_trigger_input. Import Alazar settings only
-    after the test has been explicitly configured.
+    acquisition-active AUX output to record_clock_input. The selected NI
+    counter routes its internal output to AO without another jumper.
+    Import Alazar settings only after the test has been explicitly configured.
 
     Hold a caller-selected constant angle during acquisition. Preflight both
     angle targets and nominal timing before commanding output. Require at
@@ -64,11 +63,11 @@ def test_alazar_triggered_frame_sequence() -> None:
         raise ValueError("The sequence test timeout must be finite and positive.")
     if not math.isfinite(settling_time) or settling_time < 0:
         raise ValueError("settling_time must be finite and nonnegative.")
-    command_angle = units.Angle(parameters["command_angle"])
+    command_amplitude = units.Angle(parameters["command_amplitude"])
     final_angle = units.Angle(parameters["final_angle"])
     ao_rate = units.SampleRate(parameters["ao_sample_rate"])
     waveform = AngularWaveform(
-        np.full(parameters["ao_sample_count"], float(command_angle)),
+        float(command_amplitude) * np.linspace(-1, 1, parameters["ao_sample_count"]),
         sample_rate=ao_rate,
     )
     final_waveform = AngularWaveform([float(final_angle)], sample_rate=ao_rate)
@@ -76,7 +75,6 @@ def test_alazar_triggered_frame_sequence() -> None:
         source=parameters["record_clock_input"],
         max_rate=units.SampleRate(parameters["max_record_rate"]),
     )
-    frame_trigger = DigitalStartTrigger(source=parameters["frame_trigger_input"])
 
     # Keep the optional Alazar dependency out of normal NI test imports and
     # type checking. A configured but unavailable plugin must fail the test.
@@ -122,12 +120,14 @@ def test_alazar_triggered_frame_sequence() -> None:
             plan,
             {scanner: waveform},
             record_clock=record_clock,
-            frame_clock_channel=parameters["frame_clock_output"],
-            frame_trigger=frame_trigger,
+            frame_counter_channel=parameters["frame_counter_channel"],
         )
+
+        # Passive validation precedes output. Reverse callback order closes
+        # sessions before applying the final angle and closing the devices.
         cleanup.callback(setattr, scanner, "angle", final_angle)
         cleanup.callback(sequence.close)
-        scanner.angle = command_angle
+        scanner.angle = command_amplitude
         sleep(settling_time)
         sequence.prepare()
 
@@ -165,7 +165,7 @@ def test_alazar_triggered_frame_sequence() -> None:
         except TimeoutError as failure:
             failure.add_note(
                 "Check Alazar record triggers, AUX-to-record-clock wiring, "
-                "frame-output-to-AO-trigger wiring, and AO timing margin."
+                "counter-to-AO routing, and AO timing margin."
             )
             raise
 
@@ -182,10 +182,12 @@ def test_alazar_triggered_frame_sequence() -> None:
             plan,
             {scanner: waveform},
             record_clock=record_clock,
-            frame_clock_channel=parameters["frame_clock_output"],
-            frame_trigger=frame_trigger,
+            frame_counter_channel=parameters["frame_counter_channel"],
         )
         cleanup.callback(retry.close)
         retry.prepare()
         assert retry.state is CaptureState.PREPARED
         assert retry.layout == layout
+
+
+test_alazar_triggered_frame_sequence()

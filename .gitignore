@@ -219,5 +219,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-
+# Dirigo
+.vscode/
 /tests/hardware/hardware_local.toml

@@ -1,15 +1,12 @@
-"""Generate finite frame-start pulses from acquired-record clock edges."""
+"""Divide acquired-record events into internally routable counter frame pulses."""
 
-import math
 import re
-from numbers import Real
 
 import nidaqmx
-import numpy as np
 from dirigo.hardware.frame_plan import RecordFramePlan
 from dirigo.hardware.output import OutputState
-from dirigo.hardware.timing import ExternalSampleClock, SignalEdge
-from nidaqmx import constants, errors
+from dirigo.hardware.timing import DigitalStartTrigger, ExternalSampleClock, SignalEdge
+from nidaqmx import constants
 
 _WAIT_UNTIL_DONE_TIMEOUT = -200560
 _NI_EDGES = {
@@ -19,61 +16,78 @@ _NI_EDGES = {
 
 
 class NIFrameClockSession:
-    """Own a finite Port 0 digital pattern advancing once per acquired record.
+    """Divide acquired-record events into continuous frame-trigger pulses.
 
-    output_channel names one line, e.g. Dev1/port0/line0. record_clock names
-    the NI input receiving one active edge per acquired record. Its max_rate
-    is the maximum expected record-event rate, not the ADC sample rate.
-    NI validates the physical line, clock route, and rate during preparation.
+    counter_channel selects one counter, e.g. Dev1/ctr0. record_clock supplies
+    one active edge per acquired record. Its max_rate describes record events,
+    not ADC samples. Counter timing uses these events directly as ticks.
 
-    Sample zero is high. Later samples are high exactly at the plan's frame
-    starts and low otherwise. Pulses last one record-clock interval. Require
-    at least two records per frame so pulses have intervening low samples and
-    the final generated sample is low. Output pulses always have rising edges;
-    record_clock.active_edge selects which input edges advance the pattern.
+    Each pulse is high for two ticks and low for records_per_frame - 2 ticks.
+    At least four records per frame are required. Preparation requests zero
+    initial delay but permits NI's hardware minimum. A PCIe-6323 has reported
+    two record-clock ticks after committing that request. The first trigger
+    is therefore not guaranteed to coincide with the first acquired record.
+    Subsequent triggers remain records_per_frame ticks apart.
 
-    Construction is passive. prepare() drives the line low with an on-demand
-    write, then configures and preloads buffered output. Prepare before arming
-    the receiving AO task. Arm AO, call this session's start(), then start the
-    capture supplying record events. The clock must remain quiet until then.
-    Wire the output line to the AO trigger input used by the receiving task.
+    Logical frame grouping remains defined by the plan. Downstream frame
+    processing accounts for line alignment, including galvo response delay.
+    This session does not provide an adjustable alignment parameter.
 
-    COMPLETED means the digital pattern finished; it establishes neither DMA
-    delivery nor completion of AO waveforms. Completion and stop retain the
-    task until close(). Cancellation can interrupt a high pulse; stop() and
-    close() issue no additional static write. Call methods serially and use
-    bounded waits for cooperative cancellation.
+    trigger identifies CtrNInternalOutput for same-device AO routing without
+    a jumper. export_terminal optionally also exports pulses to a physical
+    terminal. None disables the default PFI export.
+
+    Construction accesses no hardware. Arm AO, start this session, then start
+    capture. The record-clock source must remain quiet outside acquisition.
+
+    The plan supplies the divider period; frame_count does not limit this
+    continuous task. There is no wait() or natural COMPLETED state. The owner
+    explicitly stops the counter after capture and AO finish, or during
+    cancellation. stop() retains resources until close() and may interrupt a
+    pulse. No parking commands or static digital writes are performed.
     """
 
     def __init__(
         self,
         plan: RecordFramePlan,
         *,
-        output_channel: str,
+        counter_channel: str,
         record_clock: ExternalSampleClock,
+        export_terminal: str | None = None,
     ) -> None:
         """Validate the finite plan and connection descriptions without NI calls."""
         if not isinstance(plan, RecordFramePlan):
             raise TypeError("plan must be a RecordFramePlan.")
-        if plan.records_per_frame < 2:
-            raise ValueError("Frame clock requires at least two records per frame.")
+        if plan.records_per_frame < 4:
+            raise ValueError(
+                "Counter frame clock requires at least four records per frame."
+            )
         if not isinstance(record_clock, ExternalSampleClock):
             raise TypeError("record_clock must be an ExternalSampleClock.")
-        if not isinstance(output_channel, str):
-            raise TypeError("output_channel must be a string.")
-        if (
-            re.fullmatch(
-                r"/?[A-Za-z0-9_-]+/port0/line[0-9]+",
-                output_channel,
-                flags=re.IGNORECASE,
+        if not isinstance(counter_channel, str):
+            raise TypeError("counter_channel must be a string.")
+        match = re.fullmatch(
+            r"/?([A-Za-z0-9_-]+)/ctr([0-9]+)", counter_channel, flags=re.IGNORECASE
+        )
+        if match is None:
+            raise ValueError(
+                "counter_channel must name one NI counter, e.g. Dev1/ctr0."
             )
-            is None
-        ):
-            raise ValueError("output_channel must name one NI Port 0 digital line.")
+        if export_terminal is not None:
+            if not isinstance(export_terminal, str):
+                raise TypeError("export_terminal must be a string or None.")
+            if not export_terminal or export_terminal != export_terminal.strip():
+                raise ValueError(
+                    "export_terminal must be nonempty without edge whitespace."
+                )
 
         self._plan = plan
-        self._output_channel = output_channel
+        self._counter_channel = counter_channel
         self._record_clock = record_clock
+        self._export_terminal = export_terminal
+        self._trigger = DigitalStartTrigger(
+            source=f"/{match[1]}/Ctr{int(match[2])}InternalOutput"
+        )
         self._task: nidaqmx.Task | None = None
         self._running = False
         self._state = OutputState.NEW
@@ -83,46 +97,48 @@ class NIFrameClockSession:
         """Last observed state; STARTED can mean waiting for record-clock edges."""
         return self._state
 
+    @property
+    def trigger(self) -> DigitalStartTrigger:
+        """Rising-edge trigger on the counter's internally routable output."""
+        return self._trigger
+
     def prepare(self) -> None:
-        """Drive low, then preload finite output, closing partial resources on error."""
+        """Commit continuous pulses and reject changes to the divider period."""
         self._require_state(OutputState.NEW)
         try:
-            samples = np.zeros(self._plan.record_count, dtype=np.bool_)
-            samples[:: self._plan.records_per_frame] = True
             task = nidaqmx.Task()
             self._task = task
-            task.do_channels.add_do_chan(
-                lines=self._output_channel,
-                line_grouping=constants.LineGrouping.CHAN_PER_LINE,
+            high = 2
+            low = self._plan.records_per_frame - high
+            channel = task.co_channels.add_co_pulse_chan_ticks(
+                counter=self._counter_channel,
+                source_terminal=self._record_clock.source,
+                idle_state=constants.Level.LOW,
+                initial_delay=0,
+                low_ticks=low,
+                high_ticks=high,
             )
-
-            # A fresh task is on-demand. Track possible activity before the
-            # write because a failed auto-start may still have started it.
-            self._running = True
-            if task.write(False, auto_start=True) != 1:
-                raise RuntimeError("NI task did not accept the inactive level.")
-            self._running = False
-            task.stop()
-            task.control(constants.TaskMode.TASK_UNRESERVE)
-
-            clock = self._record_clock
-            task.timing.cfg_samp_clk_timing(
-                rate=float(clock.max_rate),
-                source=clock.source,
-                active_edge=_NI_EDGES[clock.active_edge],
-                sample_mode=constants.AcquisitionType.FINITE,
-                samps_per_chan=samples.size,
+            channel.co_ctr_timebase_active_edge = _NI_EDGES[
+                self._record_clock.active_edge
+            ]
+            channel.co_pulse_term = self._export_terminal or ""
+            task.timing.cfg_implicit_timing(
+                sample_mode=constants.AcquisitionType.CONTINUOUS,
             )
-            if task.write(samples, auto_start=False) != samples.size:
-                raise RuntimeError("NI task did not accept every frame-clock sample.")
             task.control(constants.TaskMode.TASK_COMMIT)
+            actual = (
+                channel.co_pulse_high_ticks,
+                channel.co_pulse_low_ticks,
+            )
+            if actual != (high, low):
+                raise RuntimeError("NI coerced the requested frame-clock tick counts.")
         except BaseException as failure:
             self._close_after_failure(failure)
             raise
         self._state = OutputState.PREPARED
 
     def start(self) -> None:
-        """Arm the preloaded pattern before the source starts supplying records."""
+        """Arm the counter before capture starts supplying record events."""
         self._require_state(OutputState.PREPARED)
         task = self._task
         assert task is not None
@@ -134,38 +150,6 @@ class NIFrameClockSession:
             self._close_after_failure(failure)
             raise
 
-    def wait(self, timeout: float | None = None) -> bool:
-        """Return True for finite completion or False for timeout or prior stop."""
-        if timeout is not None:
-            if isinstance(timeout, bool) or not isinstance(timeout, Real):
-                raise TypeError("timeout must be a real number of seconds or None.")
-            timeout = float(timeout)
-            if not math.isfinite(timeout) or timeout < 0:
-                raise ValueError("timeout must be finite and nonnegative.")
-        if self._state is OutputState.COMPLETED:
-            return True
-        if self._state is OutputState.STOPPED:
-            return False
-        self._require_state(OutputState.STARTED)
-        task = self._task
-        assert task is not None
-        try:
-            task.wait_until_done(
-                timeout=constants.WAIT_INFINITELY if timeout is None else timeout
-            )
-        except BaseException as failure:
-            if (
-                isinstance(failure, errors.DaqError)
-                and timeout is not None
-                and failure.error_code == _WAIT_UNTIL_DONE_TIMEOUT
-            ):
-                return False
-            self._close_after_failure(failure)
-            raise
-        self._running = False
-        self._state = OutputState.COMPLETED
-        return True
-
     def stop(self) -> None:
         """Stop once while retaining the prepared task until close()."""
         try:
@@ -175,9 +159,8 @@ class NIFrameClockSession:
             raise
 
     def _stop_unfinished(self) -> None:
-        """Stop possible activity during baseline setup or buffered generation."""
+        """Stop possible activity after a complete or partially failed start."""
         if self._state in (
-            OutputState.COMPLETED,
             OutputState.STOPPED,
             OutputState.CLOSED,
         ):
