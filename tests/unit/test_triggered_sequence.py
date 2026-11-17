@@ -1,8 +1,10 @@
 """Test frame-sequence coordination with real child lifecycles and fake NI calls."""
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from functools import partial
+from threading import Event, get_ident
 from typing import cast
 from unittest.mock import Mock, PropertyMock
 
@@ -19,16 +21,24 @@ from dirigo.hardware.capture import (
 from dirigo.hardware.capture_session import CaptureState, DigitizerCaptureSession
 from dirigo.hardware.digitizer import Digitizer
 from dirigo.hardware.frame_plan import RecordFramePlan
+from dirigo.hardware.hardware import Hardware
 from dirigo.hardware.simulated_digitizer import (
     SimulatedDigitizer,
     SimulatedDigitizerConfig,
 )
 from dirigo.hardware.timing import ExternalSampleClock
 from dirigo.hardware.waveform import AngularWaveform
+from dirigo.pipeline.exceptions import EndOfStream
+from dirigo.pipeline.pipeline import Pipeline
+from dirigo.pipeline.product import Product
+from dirigo.pipeline.sink import Sink
+from dirigo.records import RecordBatch
+from dirigo.sources.frame_acquisition import FrameAcquisitionWorker
 from nidaqmx import stream_writers
 
 from dirigo_nidaq import retriggered_output as output_module
 from dirigo_nidaq import triggered_sequence as sequence_module
+from dirigo_nidaq.acquisition import nidaq_triggered
 from dirigo_nidaq.scanner import NIGalvoScanner, NIGalvoScannerConfig
 from dirigo_nidaq.triggered_sequence import NITriggeredFrameSequence
 
@@ -192,8 +202,8 @@ def rig(monkeypatch: pytest.MonkeyPatch) -> Iterator[Rig]:
         digitizer.close()
 
 
-def _sequence(rig: Rig) -> NITriggeredFrameSequence:
-    """Create a fresh run and queue its clock/AO tasks for later preparation."""
+def _queue_tasks(rig: Rig) -> None:
+    """Queue fake NI tasks for preparation by a sequence or worker."""
     clock = Mock()
     output = Mock()
 
@@ -231,6 +241,13 @@ def _sequence(rig: Rig) -> NITriggeredFrameSequence:
         raising=False,
     )
     rig.pending[:] = [clock, output]
+
+
+def _sequence(rig: Rig) -> NITriggeredFrameSequence:
+    """Create a fresh run and queue its clock/AO tasks for later preparation."""
+
+    _queue_tasks(rig)
+
     sequence = NITriggeredFrameSequence(
         rig.digitizer,
         rig.plan,
@@ -633,3 +650,220 @@ def test_unexpected_prepared_record_batching_is_rejected(rig: Rig) -> None:
     assert sequence.state is CaptureState.CLOSED
     rig.factory.assert_not_called()
     _sequence(rig).prepare()
+
+
+class CollectRecordBatches(Sink[RecordBatch]):
+    """Retain unpooled products without copying their sample arrays."""
+
+    def __init__(self, upstream: FrameAcquisitionWorker) -> None:
+        super().__init__(upstream=upstream)
+        self.products: list[Product[RecordBatch]] = []
+
+    def _prepare(self) -> None:
+        """Allocate no external resources."""
+
+    def _work(self) -> None:
+        """Keep original products until the upstream publisher reaches EOF."""
+        while True:
+            try:
+                with self._receive() as product:
+                    self.products.append(product)
+            except EndOfStream:
+                return
+
+    def _close(self) -> None:
+        """Retain collected products for assertions after completion."""
+
+
+@contextmanager
+def _running_acquisition(
+    rig: Rig,
+) -> Generator[tuple[Pipeline, CollectRecordBatches]]:
+    """Run real pipeline/session lifecycles using the existing fake NI tasks.
+
+    Finish worker threads before closing the hardware collection. Device
+    closure is idempotent, allowing the existing rig finalizer to run.
+    """
+    _queue_tasks(rig)
+    hardware = Hardware({"digitizer": rig.digitizer, "galvo": rig.axis})
+    source = FrameAcquisitionWorker(
+        rig.plan,
+        sequence="nidaq_triggered",
+        factories={"nidaq_triggered": nidaq_triggered},
+        sequence_config={
+            "digitizer": "digitizer",
+            "record_clock_input": "/Dev1/PFI0",
+            "max_record_rate": "8 kS/s",
+            "frame_counter_channel": "Dev1/ctr0",
+        },
+        waveforms={
+            "galvo": AngularWaveform(
+                [0.0] * 20,
+                sample_rate=units.SampleRate("20 kS/s"),
+            )
+        },
+        read_timeout=0.01,
+    )
+    sink = CollectRecordBatches(source)
+    pipeline = Pipeline(sink, hardware=hardware)
+
+    rig.factory.assert_not_called()
+
+    try:
+        pipeline.start()
+        yield pipeline, sink
+    finally:
+        try:
+            if not pipeline.done:
+                pipeline.abort()
+                pipeline.wait(timeout=2)
+        finally:
+            hardware.close()
+
+
+def test_acquisition_pipeline_publishes_owned_positioned_batches(
+    rig: Rig,
+) -> None:
+    """Preserve raw batches across publication, closure, and device reuse.
+
+    The sink keeps original products after receive() exits. Comparing their
+    samples after the source finishes detects accidental buffer recycling.
+    Four-record batches cross six-record logical frame boundaries:
+    first_record describes records, while sequence_index counts batches.
+    Native task creation must occur on the acquisition thread.
+    """
+    caller_thread = get_ident()
+    task_threads: list[int] = []
+    original_factory = cast(Callable[[], Mock], rig.factory.side_effect)
+
+    def make_task() -> Mock:
+        """Observe task creation while retaining the existing fake tasks."""
+        task_threads.append(get_ident())
+        return original_factory()
+
+    rig.factory.side_effect = make_task
+
+    with _running_acquisition(rig) as (pipeline, sink):
+        pipeline.wait(timeout=2)
+
+        assert pipeline.exception is None
+        assert task_threads == [caller_thread, caller_thread]
+
+        products = sink.products
+        batches = [product.payload for product in products]
+
+        assert [product.metadata.sequence_index for product in products] == [0, 1, 2]
+        assert [batch.first_record for batch in batches] == [0, 4, 8]
+        assert all(batch.records_per_frame == 6 for batch in batches)
+        assert all(batch.layout.shape == (4, 4, 1) for batch in batches)
+        assert all(isinstance(batch.info, CaptureInfo) for batch in batches)
+        assert all(not batch.samples.flags.writeable for batch in batches)
+
+        for index, batch in enumerate(batches):
+            assert batch.samples.flags.owndata
+            for earlier in batches[:index]:
+                assert not np.shares_memory(
+                    batch.samples,
+                    earlier.samples,
+                )
+
+        expected = (
+            (np.arange(48, dtype=np.int32) - 32768).astype(np.int16).reshape(12, 4, 1)
+        )
+        np.testing.assert_array_equal(
+            np.concatenate([batch.samples for batch in batches]),
+            expected,
+        )
+
+        assert rig.captures[0].state is CaptureState.CLOSED
+        assert not rig.digitizer.is_active
+        for task in rig.created:
+            task.close.assert_called_once_with()
+        rig.created[0].wait_until_done.assert_not_called()
+
+        retry = _sequence(rig)
+        try:
+            retry.prepare()
+        finally:
+            retry.close()
+
+
+def test_acquisition_pipeline_cancels_while_waiting_for_records(
+    rig: Rig,
+) -> None:
+    """Abort a waiting read without a hardware error or published data.
+
+    The capture hook signals entry and waits only for its supplied timeout.
+    Abort runs through Pipeline and the worker's next polling boundary.
+    Cleanup must release both NI tasks and the digitizer reservation.
+    """
+    waiting = Event()
+    wake = Event()
+    original_create = rig.digitizer._create_capture
+
+    def create(settings: CaptureSettings) -> DigitizerCaptureSession:
+        """Use the real session with a bounded, waiting transfer hook."""
+        capture = original_create(settings)
+
+        def wait_for_record(
+            destination: SampleArray,
+            *,
+            timeout: float | None,
+        ) -> CaptureInfo:
+            """Model a quiet trigger input using a bounded wait."""
+            assert timeout is not None
+            assert timeout > 0
+            waiting.set()
+            wake.wait(timeout=timeout)
+            raise TimeoutError("No record yet.")
+
+        rig.monkeypatch.setattr(
+            capture,
+            "_read_into",
+            wait_for_record,
+        )
+        return capture
+
+    rig.monkeypatch.setattr(
+        rig.digitizer,
+        "_create_capture",
+        create,
+    )
+
+    with _running_acquisition(rig) as (pipeline, sink):
+        try:
+            assert waiting.wait(timeout=2)
+            pipeline.abort()
+            wake.set()
+            pipeline.wait(timeout=2)
+        finally:
+            wake.set()
+
+        assert pipeline.exception is None
+        assert sink.products == []
+        assert rig.captures[0].state is CaptureState.CLOSED
+        assert not rig.digitizer.is_active
+
+        for task in rig.created:
+            task.stop.assert_called_once_with()
+            task.close.assert_called_once_with()
+
+
+def test_acquisition_pipeline_propagates_capture_failure(
+    rig: Rig,
+) -> None:
+    """Report the original capture error after cleanup releases hardware."""
+    failure = RuntimeError("Capture failed.")
+    rig.failures["capture.read"] = failure
+
+    with _running_acquisition(rig) as (pipeline, sink):
+        with pytest.raises(RuntimeError) as caught:
+            pipeline.wait(timeout=2)
+
+        assert caught.value is failure
+        assert sink.products == []
+        assert rig.captures[0].state is CaptureState.CLOSED
+        assert not rig.digitizer.is_active
+
+        for task in rig.created:
+            task.close.assert_called_once_with()

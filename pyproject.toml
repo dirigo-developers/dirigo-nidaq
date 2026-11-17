@@ -57,3 +57,6 @@ nidaq_galvo = "dirigo_nidaq.scanner:NIGalvoScanner"
 
 [project.entry-points."dirigo.devices.digitizers"]
 nidaq = "dirigo_nidaq.digitizer:NIDigitizer"
+
+[project.entry-points."dirigo.acquisition_sequences"]
+nidaq_triggered = "dirigo_nidaq.acquisition:nidaq_triggered"
