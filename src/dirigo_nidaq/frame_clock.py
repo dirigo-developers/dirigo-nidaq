@@ -49,16 +49,25 @@ class NIFrameClockSession:
 
     def __init__(
         self,
-        plan: RecordFramePlan,
+        plan: RecordFramePlan | None = None,
         *,
+        records_per_frame: int | None = None,
         counter_channel: str,
         record_clock: ExternalSampleClock,
         export_terminal: str | None = None,
     ) -> None:
         """Validate the finite plan and connection descriptions without NI calls."""
-        if not isinstance(plan, RecordFramePlan):
-            raise TypeError("plan must be a RecordFramePlan.")
-        if plan.records_per_frame < 4:
+        if records_per_frame is None:
+            if not isinstance(plan, RecordFramePlan):
+                raise TypeError("plan must be a RecordFramePlan.")
+            records_per_frame = plan.records_per_frame
+        elif plan is not None:
+            raise ValueError("Supply either plan or records_per_frame.")
+
+        if type(records_per_frame) is not int:
+            raise TypeError("records_per_frame must be an integer.")
+
+        if records_per_frame < 4:
             raise ValueError(
                 "Counter frame clock requires at least four records per frame."
             )
@@ -81,7 +90,7 @@ class NIFrameClockSession:
                     "export_terminal must be nonempty without edge whitespace."
                 )
 
-        self._plan = plan
+        self._records_per_frame = records_per_frame
         self._counter_channel = counter_channel
         self._record_clock = record_clock
         self._export_terminal = export_terminal
@@ -109,7 +118,7 @@ class NIFrameClockSession:
             task = nidaqmx.Task()
             self._task = task
             high = 2
-            low = self._plan.records_per_frame - high
+            low = self._records_per_frame - high
             channel = task.co_channels.add_co_pulse_chan_ticks(
                 counter=self._counter_channel,
                 source_terminal=self._record_clock.source,

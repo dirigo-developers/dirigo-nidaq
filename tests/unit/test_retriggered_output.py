@@ -457,3 +457,33 @@ def test_constructor_requires_an_explicit_frame_trigger(
             frame_count=1,
         )
     ni.factory.assert_not_called()
+
+
+def test_unlimited_output_requires_explicit_stop(
+    axes: tuple[NIGalvoScanner, NIGalvoScanner],
+    ni: FakeNI,
+) -> None:
+    """An unlimited run has no finite completion wait."""
+    output = NIRetriggeredGalvoOutputSession(
+        {axes[0]: _waveform(0, 1, 2)},
+        start_trigger=DigitalStartTrigger(source="/Dev1/PFI1"),
+        frame_count=None,
+    )
+
+    try:
+        output.prepare()
+        output.start()
+
+        assert output.frame_count is None
+
+        with pytest.raises(RuntimeError, match="no completion target"):
+            output.wait(timeout=0)
+
+        # Rejecting the wait did not cancel an otherwise usable run.
+        assert output.state is OutputState.STARTED
+        ni.task.stop.assert_not_called()
+
+        output.stop()
+        ni.task.stop.assert_called_once_with()
+    finally:
+        output.close()

@@ -245,13 +245,14 @@ class NIDigitizer(Digitizer):
         settings: CaptureSettings,
     ) -> NICaptureSession:
         """Validate a complete request and construct an unprepared session."""
+        validated = self._validate_capture_settings(settings)
+        return NICaptureSession(self, validated)
+
+    def _validate_capture_settings(
+        self, settings: CaptureSettings
+    ) -> NICaptureSettings:
         if not isinstance(settings, NICaptureSettings):
             raise TypeError("settings must be NICaptureSettings.")
-
-        self._validate_capture_settings(settings)
-        return NICaptureSession(self, settings)
-
-    def _validate_capture_settings(self, settings: CaptureSettings) -> None:
         if settings.batch_count is None:
             raise NotImplementedError("NI capture requires finite batch_count.")
         if settings.timestamps_enabled and settings.external_clock is not None:
@@ -262,6 +263,7 @@ class NIDigitizer(Digitizer):
             raise NotImplementedError(
                 "NI capture does not support record triggers yet."
             )
+        return settings
 
     def create_capture(
         self,

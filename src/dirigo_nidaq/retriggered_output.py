@@ -32,6 +32,7 @@ class NIRetriggeredGalvoOutputSession(NIGalvoOutputSession):
     wait() polls NI's generated-samples-per-channel count, rather than using
     wait_until_done() on a task that rearms indefinitely. Once all expected
     samples are reported generated, wait() stops the task and returns True.
+    frame_count=None rearms until stopped and does not support wait().
     A timeout retains the armed task and axis reservations. frame_count is a
     software completion target, not a hardware limit on accepted triggers.
     Observed excess generation raises an error; polling cannot prevent extra
@@ -47,24 +48,27 @@ class NIRetriggeredGalvoOutputSession(NIGalvoOutputSession):
         waveforms: Mapping[GalvoScanner, AngularWaveform],
         *,
         start_trigger: DigitalStartTrigger,
-        frame_count: int,
+        frame_count: int | None,
     ) -> None:
         """Validate one-frame waveforms and the finite target without NI calls."""
         if not isinstance(start_trigger, DigitalStartTrigger):
             raise TypeError("start_trigger must be a DigitalStartTrigger.")
-        if isinstance(frame_count, bool) or not isinstance(frame_count, int):
-            raise TypeError("frame_count must be an integer.")
-        if frame_count <= 0:
-            raise ValueError("frame_count must be positive.")
+        if frame_count is not None:
+            if type(frame_count) is not int:
+                raise TypeError("frame_count must be an integer or None.")
+            if frame_count <= 0:
+                raise ValueError("frame_count must be positive.")
         super().__init__(waveforms, start_trigger=start_trigger)
         self._frame_count = frame_count
-        self._expected_samples = self._sample_count * frame_count
+        self._expected_samples = (
+            None if frame_count is None else self._sample_count * frame_count
+        )
         self._generated_samples = 0
         self._armed = False
 
     @property
-    def frame_count(self) -> int:
-        """Expected number of complete one-frame waveform generations."""
+    def frame_count(self) -> int | None:
+        """Expected frame count, or None for output stopped explicitly."""
         return self._frame_count
 
     @property
@@ -76,6 +80,13 @@ class NIRetriggeredGalvoOutputSession(NIGalvoOutputSession):
         that hardware has remained idle.
         """
         return self._generated_samples // self._sample_count
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Observe a finite target; unlimited output requires explicit stop()."""
+        if self._frame_count is None:
+            raise RuntimeError("Unlimited output has no completion target.")
+
+        return super().wait(timeout=timeout)
 
     def _configure_output_task(self, task: nidaqmx.Task) -> None:
         """Enable repeated hardware starts and reuse of the one-frame buffer."""
@@ -94,6 +105,10 @@ class NIRetriggeredGalvoOutputSession(NIGalvoOutputSession):
 
     def _wait_output(self, timeout: float | None) -> bool:
         """Observe generated samples until the finite target or timeout is reached."""
+        expected = self._expected_samples
+        if expected is None:
+            raise RuntimeError("Unlimited output has no completion target.")
+
         deadline = None if timeout is None else time.monotonic() + timeout
         task = self._require_task()
         while True:
@@ -103,10 +118,10 @@ class NIRetriggeredGalvoOutputSession(NIGalvoOutputSession):
             generated = task.out_stream.total_samp_per_chan_generated
             if generated < self._generated_samples:
                 raise RuntimeError("NI generated-sample count moved backwards.")
-            if generated > self._expected_samples:
+            if generated > expected:
                 raise RuntimeError("NI generated more than the expected frame samples.")
             self._generated_samples = generated
-            if generated == self._expected_samples:
+            if generated == expected:
                 self._stop_output()
                 return True
             if done:

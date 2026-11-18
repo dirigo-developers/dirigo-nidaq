@@ -1,5 +1,6 @@
 """Test NI input preparation without native DAQmx libraries."""
 
+from contextlib import closing
 from dataclasses import dataclass, replace
 from importlib import metadata as importlib_metadata
 from typing import cast
@@ -12,6 +13,16 @@ from dirigo import units
 from dirigo.hardware.capture import CaptureSettings, SampleArray
 from dirigo.hardware.capture_session import CaptureState
 from dirigo.hardware.config import parse_config
+from dirigo.hardware.digitizer import (
+    ChannelProfile,
+    DigitizerProfile,
+    SampleClockEdge,
+    SampleClockProfile,
+    SampleClockSource,
+    TriggerProfile,
+    TriggerSlope,
+    TriggerSource,
+)
 from dirigo.hardware.timing import (
     DigitalRecordTrigger,
     DigitalStartTrigger,
@@ -807,3 +818,322 @@ def test_record_trigger_is_rejected_before_task_creation(ni: FakeNI) -> None:
         ni.factory.assert_not_called()
     finally:
         digitizer.close()
+
+
+def _ni_profile() -> DigitizerProfile:
+    """Request two inputs using the fake device's supported sampling rate."""
+    return DigitizerProfile(
+        sample_clock=SampleClockProfile(
+            source=SampleClockSource.INTERNAL,
+            rate=units.SampleRate("1 kS/s"),
+        ),
+        channels=(
+            ChannelProfile(
+                enabled=True,
+                input_range=units.VoltageRange("±5 V"),
+            ),
+            ChannelProfile(
+                enabled=True,
+                input_range=units.VoltageRange("±5 V"),
+            ),
+        ),
+        trigger=TriggerProfile(
+            source=TriggerSource.INTERNAL,
+            slope=TriggerSlope.RISING,
+        ),
+    )
+
+
+def test_profile_construction_and_configuration_are_passive(
+    ni: FakeNI,
+) -> None:
+    """Expose planning settings without creating or reserving an NI task."""
+    with closing(_device()) as digitizer:
+        profile = _ni_profile()
+        digitizer.profile = profile
+
+        with closing(digitizer.create_capture()) as capture:
+            assert capture.profile is profile
+            assert capture.requested_sample_rate == units.SampleRate("1 kS/s")
+            assert capture.state is CaptureState.NEW
+
+            with pytest.raises(RuntimeError, match="not configured"):
+                _ = capture.settings
+
+            with pytest.raises(RuntimeError, match="must be configured"):
+                capture.prepare()
+
+            assert capture.state is CaptureState.NEW
+            ni.factory.assert_not_called()
+
+            capture.configure(
+                record_length=4,
+                records_per_batch=2,
+                batch_count=3,
+            )
+
+            assert isinstance(capture.settings, NICaptureSettings)
+            assert capture.settings.channel_indices == (0, 1)
+            assert capture.settings.record_length == 4
+            assert capture.settings.records_per_batch == 2
+            assert capture.batch_count == 3
+
+            # Configuration did not reserve the digitizer.
+            digitizer.profile = replace(
+                profile,
+                sample_clock=replace(
+                    profile.sample_clock,
+                    rate=units.SampleRate("2 kS/s"),
+                ),
+            )
+
+            # The existing capture retains its original profile.
+            assert capture.requested_sample_rate == units.SampleRate("1 kS/s")
+
+    ni.factory.assert_not_called()
+    ni.reader_factory.assert_not_called()
+    ni.task.close.assert_not_called()
+
+
+def test_profile_capture_prepares_and_delivers_one_batch(
+    ni: FakeNI,
+) -> None:
+    """Translate stored settings into native timing, layout, and readout."""
+
+    def read(
+        data: SampleArray,
+        *,
+        number_of_samples_per_channel: int,
+        timeout: float,
+    ) -> int:
+        """Supply eight known samples for each selected input."""
+        assert number_of_samples_per_channel == 8
+        assert timeout == 0.0
+        data[:] = _channel_samples(0, 8)
+        return 8
+
+    ni.reader.read_int16.side_effect = read
+
+    with closing(_device()) as digitizer:
+        digitizer.profile = _ni_profile()
+
+        with closing(digitizer.create_capture()) as capture:
+            capture.configure(
+                record_length=4,
+                records_per_batch=2,
+                batch_count=1,
+                timestamps_enabled=True,
+            )
+            capture.prepare()
+
+            assert capture.layout.shape == (2, 4, 2)
+            assert capture.layout.channel_indices == (0, 1)
+
+            # Exposed indices follow the configured physical-channel mapping.
+            assert ni.task.ai_channels.add_ai_voltage_chan.call_args_list == [
+                call(
+                    physical_channel=name,
+                    terminal_config=constants.TerminalConfiguration.DEFAULT,
+                    min_val=-5.0,
+                    max_val=5.0,
+                )
+                for name in ("Dev1/ai2", "Dev1/ai0")
+            ]
+
+            ni.task.timing.cfg_samp_clk_timing.assert_called_once_with(
+                rate=1000.0,
+                source="",
+                active_edge=constants.Edge.RISING,
+                sample_mode=constants.AcquisitionType.FINITE,
+                samps_per_chan=8,
+            )
+            ni.task.start.assert_not_called()
+
+            capture.start()
+            samples = np.empty(
+                capture.layout.shape,
+                dtype=capture.layout.dtype,
+            )
+
+            info = capture.read_into(samples, timeout=0)
+            assert info is not None
+
+            np.testing.assert_array_equal(
+                samples,
+                _channel_samples(0, 8).T.reshape(2, 4, 2),
+            )
+
+            timestamps = info.timestamps
+            assert timestamps is not None
+            np.testing.assert_allclose(timestamps, [0.0, 0.004])
+
+            assert capture.state is CaptureState.COMPLETED
+            assert capture.read_into(samples, timeout=0) is None
+
+            ni.reader.read_int16.assert_called_once()
+            ni.task.stop.assert_not_called()
+            ni.task.close.assert_not_called()
+
+        ni.task.stop.assert_called_once_with()
+        ni.task.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_profile_rate_coercion_closes_task_and_releases_reservation(
+    ni: FakeNI,
+    cleanup_fails: bool,
+) -> None:
+    """Reject geometry-invalidating clock coercion before starting capture."""
+    ni.task.timing.samp_clk_rate = 2000.0
+
+    if cleanup_fails:
+        ni.task.close.side_effect = RuntimeError("native cleanup failed")
+
+    with closing(_device()) as digitizer:
+        digitizer.profile = _ni_profile()
+
+        with closing(digitizer.create_capture()) as capture:
+            capture.configure(
+                record_length=4,
+                records_per_batch=2,
+                batch_count=1,
+            )
+
+            with pytest.raises(ValueError, match="coerced") as caught:
+                capture.prepare()
+
+            assert capture.state is CaptureState.CLOSED
+            ni.task.start.assert_not_called()
+            ni.task.close.assert_called_once_with()
+            ni.reader_factory.assert_not_called()
+
+            if cleanup_fails:
+                assert any(
+                    "native cleanup failed" in note
+                    for note in getattr(caught.value, "__notes__", ())
+                )
+
+            # Repair the fake and verify that logical ownership was released.
+            ni.task.close.side_effect = None
+            ni.task.timing.samp_clk_rate = 1000.0
+
+            with closing(digitizer.create_capture()) as retry:
+                retry.configure(
+                    record_length=4,
+                    records_per_batch=2,
+                    batch_count=1,
+                )
+                retry.prepare()
+
+                assert retry.state is CaptureState.PREPARED
+
+            assert ni.factory.call_count == 2
+            assert ni.task.close.call_count == 2
+
+
+def test_profile_external_clock_uses_configured_receiver_route(
+    ni: FakeNI,
+) -> None:
+    """Keep the declared external rate distinct from a measured ADC rate."""
+    config = NIDigitizerConfig(
+        physical_channels="Dev1/ai2,Dev1/ai0",
+        sample_clock_input="/Dev1/PFI0",
+    )
+    profile = _ni_profile()
+    profile = replace(
+        profile,
+        sample_clock=replace(
+            profile.sample_clock,
+            source=SampleClockSource.EXTERNAL,
+            edge=SampleClockEdge.FALLING,
+        ),
+    )
+
+    # This fake internal-rate value must not become an external measurement.
+    ni.task.timing.samp_clk_rate = 2000.0
+
+    with closing(NIDigitizer(config)) as digitizer:
+        digitizer.profile = profile
+
+        with closing(digitizer.create_capture()) as capture:
+            capture.configure(
+                record_length=4,
+                records_per_batch=2,
+                batch_count=1,
+            )
+            capture.prepare()
+
+            clock = capture.settings.external_clock
+            assert clock is not None
+            assert clock.source == "/Dev1/PFI0"
+            assert clock.active_edge is SignalEdge.FALLING
+
+            assert capture.requested_sample_rate == units.SampleRate("1 kS/s")
+            assert capture.sample_rate is None
+
+            ni.task.timing.cfg_samp_clk_timing.assert_called_once_with(
+                rate=1000.0,
+                source="/Dev1/PFI0",
+                active_edge=constants.Edge.FALLING,
+                sample_mode=constants.AcquisitionType.FINITE,
+                samps_per_chan=8,
+            )
+            ni.task.start.assert_not_called()
+
+
+def test_profile_external_clock_requires_a_receiver_route(
+    ni: FakeNI,
+) -> None:
+    """Reject missing installation wiring before creating an NI task."""
+    profile = _ni_profile()
+    profile = replace(
+        profile,
+        sample_clock=replace(
+            profile.sample_clock,
+            source=SampleClockSource.EXTERNAL,
+        ),
+    )
+
+    with closing(_device()) as digitizer:
+        digitizer.profile = profile
+
+        with closing(digitizer.create_capture()) as capture:
+            with pytest.raises(ValueError, match="sample_clock_input"):
+                capture.configure(
+                    record_length=4,
+                    records_per_batch=2,
+                    batch_count=1,
+                )
+
+            assert capture.state is CaptureState.NEW
+
+    ni.factory.assert_not_called()
+
+
+def test_profile_record_triggers_are_not_silently_ignored(
+    ni: FakeNI,
+) -> None:
+    """Reject a profile requesting independently triggered NI records."""
+    profile = _ni_profile()
+    profile = replace(
+        profile,
+        trigger=replace(
+            profile.trigger,
+            source=TriggerSource.EXTERNAL,
+        ),
+    )
+
+    with closing(_device()) as digitizer:
+        digitizer.profile = profile
+
+        with closing(digitizer.create_capture()) as capture:
+            with pytest.raises(NotImplementedError, match="record triggers"):
+                capture.configure(
+                    record_length=4,
+                    records_per_batch=2,
+                    batch_count=1,
+                )
+
+            assert capture.state is CaptureState.NEW
+
+    ni.factory.assert_not_called()
