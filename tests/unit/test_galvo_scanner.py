@@ -8,8 +8,7 @@ from unittest.mock import Mock
 
 import nidaqmx
 import pytest
-from dirigo import units
-from dirigo.hardware.config import load_hardware
+from dirigo import load_system, units
 
 from dirigo_nidaq.scanner import NIGalvoScanner, NIGalvoScannerConfig
 
@@ -58,15 +57,13 @@ inverted = true
 """,
         encoding="utf-8",
     )
-    hardware = load_hardware(
-        path, drivers={"scanners": {"nidaq_galvo": NIGalvoScanner}}
-    )
+    system = load_system(path, drivers={"scanners": {"nidaq_galvo": NIGalvoScanner}})
     try:
-        scanner = hardware.require("slow_scanner", NIGalvoScanner)
+        scanner = system.require_device("slow_scanner", NIGalvoScanner)
         assert scanner.config == replace(config, inverted=True)
         assert scanner.angle is None
     finally:
-        hardware.close()
+        system.close()
     task_factory.assert_not_called()
 
 

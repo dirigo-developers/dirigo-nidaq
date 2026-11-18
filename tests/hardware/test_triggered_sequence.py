@@ -9,10 +9,9 @@ from time import monotonic, sleep
 
 import numpy as np
 import pytest
-from dirigo import units
+from dirigo import load_system, units
 from dirigo.hardware.capture import CaptureSettings
 from dirigo.hardware.capture_session import CaptureState
-from dirigo.hardware.config import load_hardware
 from dirigo.hardware.digitizer import Digitizer
 from dirigo.hardware.frame_plan import RecordFramePlan
 from dirigo.hardware.timing import (
@@ -110,10 +109,10 @@ def test_alazar_triggered_frame_sequence() -> None:
         raise ValueError("AO waveform must be shorter than the minimum frame interval.")
 
     with ExitStack() as cleanup:
-        hardware = load_hardware(config_path)
-        cleanup.callback(hardware.close)
-        digitizer = hardware.require(parameters["digitizer"], Digitizer)
-        scanner = hardware.require(parameters["scanner"], NIGalvoScanner)
+        system = load_system(config_path)
+        cleanup.callback(system.close)
+        digitizer = system.require_device(parameters["digitizer"], Digitizer)
+        scanner = system.require_device(parameters["scanner"], NIGalvoScanner)
         scanner.validate_waveform(final_waveform)
         sequence = NITriggeredFrameSequence(
             digitizer,
@@ -188,6 +187,3 @@ def test_alazar_triggered_frame_sequence() -> None:
         retry.prepare()
         assert retry.state is CaptureState.PREPARED
         assert retry.layout == layout
-
-
-test_alazar_triggered_frame_sequence()

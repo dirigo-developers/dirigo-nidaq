@@ -2,8 +2,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from dirigo import units
-from dirigo.hardware.config import load_hardware
+from dirigo import load_system, units
 from dirigo.hardware.device import Device
 from dirigo.hardware.scanner import ResonantScannerConfig
 
@@ -54,12 +53,12 @@ def test_loads_flat_toml_with_inherited_parameters(tmp_path: Path) -> None:
         """,
         encoding="utf-8",
     )
-    hardware = load_hardware(
+    system = load_system(
         path, drivers={"scanners": {"nidaq_resonant": ConfigOnlyDevice}}
     )
 
     try:
-        config = hardware.require("fast_scanner", ConfigOnlyDevice).config
+        config = system.require_device("fast_scanner", ConfigOnlyDevice).config
         assert isinstance(config, ResonantScannerConfig)
         assert config.amplitude_control_channel == "Dev1/ao0"
         assert config.command_voltage_range == units.VoltageRange("0 V", "5 V")
@@ -68,7 +67,7 @@ def test_loads_flat_toml_with_inherited_parameters(tmp_path: Path) -> None:
         assert config.settling_time == units.Time("0.1 s")
         assert config.frequency_tolerance == 0.003
     finally:
-        hardware.close()
+        system.close()
 
 
 @pytest.mark.parametrize("value", [None, True, 1])

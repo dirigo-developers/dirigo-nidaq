@@ -21,7 +21,6 @@ from dirigo.hardware.capture import (
 from dirigo.hardware.capture_session import CaptureState, DigitizerCaptureSession
 from dirigo.hardware.digitizer import Digitizer
 from dirigo.hardware.frame_plan import RecordFramePlan
-from dirigo.hardware.hardware import Hardware
 from dirigo.hardware.simulated_digitizer import (
     SimulatedDigitizer,
     SimulatedDigitizerConfig,
@@ -34,6 +33,7 @@ from dirigo.pipeline.product import Product
 from dirigo.pipeline.sink import Sink
 from dirigo.records import RecordBatch
 from dirigo.sources.frame_acquisition import FrameAcquisitionWorker
+from dirigo.system import System
 from nidaqmx import stream_writers
 
 from dirigo_nidaq import retriggered_output as output_module
@@ -685,9 +685,10 @@ def _running_acquisition(
     closure is idempotent, allowing the existing rig finalizer to run.
     """
     _queue_tasks(rig)
-    hardware = Hardware({"digitizer": rig.digitizer, "galvo": rig.axis})
+    system = System({"digitizer": rig.digitizer, "galvo": rig.axis})
     source = FrameAcquisitionWorker(
         rig.plan,
+        system=system,
         sequence="nidaq_triggered",
         factories={"nidaq_triggered": nidaq_triggered},
         sequence_config={
@@ -705,7 +706,7 @@ def _running_acquisition(
         read_timeout=0.01,
     )
     sink = CollectRecordBatches(source)
-    pipeline = Pipeline(sink, hardware=hardware)
+    pipeline = Pipeline(sink)
 
     rig.factory.assert_not_called()
 
@@ -718,7 +719,7 @@ def _running_acquisition(
                 pipeline.abort()
                 pipeline.wait(timeout=2)
         finally:
-            hardware.close()
+            system.close()
 
 
 def test_acquisition_pipeline_publishes_owned_positioned_batches(

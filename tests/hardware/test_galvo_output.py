@@ -6,8 +6,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
-from dirigo import units
-from dirigo.hardware.config import load_hardware
+from dirigo import load_system, units
 from dirigo.hardware.scanner import GalvoScanner
 from dirigo.hardware.waveform import AngularWaveform
 
@@ -41,14 +40,14 @@ def test_ni_galvo_output() -> None:
         raise ValueError("The galvo test timeout must be finite and positive.")
 
     with ExitStack() as cleanup:
-        hardware = load_hardware(config_path)
-        cleanup.callback(hardware.close)
+        system = load_system(config_path)
+        cleanup.callback(system.close)
 
         waveforms: dict[GalvoScanner, AngularWaveform] = {}
         final_angles: list[tuple[NIGalvoScanner, units.Angle]] = []
 
         for entry in settings["axes"]:
-            scanner = hardware.require(entry["scanner"], NIGalvoScanner)
+            scanner = system.require_device(entry["scanner"], NIGalvoScanner)
             if scanner in waveforms:
                 raise ValueError("Each scanner may appear only once in [test.galvo].")
 

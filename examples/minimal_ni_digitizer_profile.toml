@@ -1,0 +1,11 @@
+channels = [
+    {enabled = true, input_range = "±5 V"},
+]
+
+[sample_clock]
+source = "internal"
+rate = "100 kS/s"
+
+[trigger]
+source = "internal"
+slope = "rising"

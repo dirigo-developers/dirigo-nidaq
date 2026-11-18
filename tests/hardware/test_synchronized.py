@@ -8,9 +8,8 @@ from time import monotonic
 
 import numpy as np
 import pytest
-from dirigo import units
+from dirigo import load_system, units
 from dirigo.hardware.capture_session import CaptureState
-from dirigo.hardware.config import load_hardware
 from dirigo.hardware.waveform import AngularWaveform
 from nidaqmx.constants import TerminalConfiguration
 
@@ -78,11 +77,11 @@ def test_ni_synchronized_scan() -> None:
     )
 
     with ExitStack() as cleanup:
-        hardware = load_hardware(config_path)
-        cleanup.callback(hardware.close)
+        system = load_system(config_path)
+        cleanup.callback(system.close)
 
-        digitizer = hardware.require(parameters["digitizer"], NIDigitizer)
-        scanner = hardware.require(parameters["scanner"], NIGalvoScanner)
+        digitizer = system.require_device(parameters["digitizer"], NIDigitizer)
+        scanner = system.require_device(parameters["scanner"], NIGalvoScanner)
         scanner.validate_waveform(final_waveform)
         scan = NISynchronizedScan(digitizer, request, {scanner: waveform})
 

@@ -3,8 +3,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from dirigo import units
-from dirigo.hardware.config import load_hardware
+from dirigo import load_system, units
 
 from dirigo_nidaq.scanner import NIResonantScanner
 
@@ -21,9 +20,9 @@ def test_ni_resonant_scanner_commands() -> None:
     test_amplitude = units.Angle(settings["amplitude"])
     final_amplitude = units.Angle(settings["final_amplitude"])
 
-    hardware = load_hardware(config_path)
+    system = load_system(config_path)
     try:
-        scanner = hardware.require(scanner_name, NIResonantScanner)
+        scanner = system.require_device(scanner_name, NIResonantScanner)
 
         # Validate both targets before issuing either command.
         for name, amplitude in (
@@ -44,4 +43,4 @@ def test_ni_resonant_scanner_commands() -> None:
         finally:
             scanner.amplitude = final_amplitude
     finally:
-        hardware.close()
+        system.close()

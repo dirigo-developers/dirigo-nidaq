@@ -9,10 +9,9 @@ from time import monotonic, sleep
 
 import numpy as np
 import pytest
-from dirigo import units
+from dirigo import load_system, units
 from dirigo.hardware.capture import CaptureSettings
 from dirigo.hardware.capture_session import CaptureState
-from dirigo.hardware.config import load_hardware
 from dirigo.hardware.digitizer import Digitizer
 from dirigo.hardware.timing import (
     DigitalRecordTrigger,
@@ -100,11 +99,11 @@ def test_alazar_triggered_frame() -> None:
         raise ValueError("The frame hardware test requires finite batch_count.")
 
     with ExitStack() as cleanup:
-        hardware = load_hardware(config_path)
-        cleanup.callback(hardware.close)
+        system = load_system(config_path)
+        cleanup.callback(system.close)
 
-        digitizer = hardware.require(parameters["digitizer"], Digitizer)
-        scanner = hardware.require(parameters["scanner"], NIGalvoScanner)
+        digitizer = system.require_device(parameters["digitizer"], Digitizer)
+        scanner = system.require_device(parameters["scanner"], NIGalvoScanner)
         scanner.validate_waveform(final_waveform)
 
         capture = digitizer.create_capture(request)

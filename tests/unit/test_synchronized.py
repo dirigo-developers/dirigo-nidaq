@@ -68,7 +68,7 @@ class RecordingCapture(NICaptureSession):
 
     def _prepare_capture(self) -> CaptureLayout:
         self._step("ai.prepare")
-        settings = self._settings
+        settings = self.settings
         return CaptureLayout(
             shape=(
                 settings.records_per_batch,

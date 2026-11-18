@@ -2,7 +2,7 @@
 
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from importlib import metadata as importlib_metadata
 from typing import cast
 
@@ -16,9 +16,13 @@ from dirigo.hardware.capture import (
     SampleArray,
 )
 from dirigo.hardware.capture_session import DigitizerCaptureSession
-from dirigo.hardware.digitizer import Digitizer
+from dirigo.hardware.digitizer import (
+    Digitizer,
+    DigitizerProfile,
+)
 from dirigo.hardware.metadata import DriverIdentity
-from dirigo.hardware.timing import SignalEdge
+from dirigo.hardware.profiles import capture_settings_from_profile
+from dirigo.hardware.timing import ExternalSampleClock, SignalEdge
 from nidaqmx import constants, errors, stream_readers
 from nidaqmx.task.channels import AIChannel
 from nidaqmx.utils import unflatten_channel_string
@@ -42,9 +46,16 @@ class NIDigitizerConfig:
         metadata={"description": "Ordered NI input-channel list or range."}
     )
     expanded_channels: tuple[str, ...] = field(init=False, repr=False)
+    sample_clock_input: str = ""
 
     def __post_init__(self) -> None:
         """Expand and validate the connection mapping without hardware access."""
+        if not isinstance(self.sample_clock_input, str):
+            raise TypeError("sample_clock_input must be a string.")
+
+        if self.sample_clock_input != self.sample_clock_input.strip():
+            raise ValueError("sample_clock_input must not have edge whitespace.")
+
         if not isinstance(self.physical_channels, str):
             raise TypeError("physical_channels must be a string.")
 
@@ -229,10 +240,18 @@ class NIDigitizer(Digitizer):
             version=version,
         )
 
-    def _create_capture(self, settings: CaptureSettings) -> NICaptureSession:
-        """Validate request types without preparing or reserving inputs."""
+    def _create_capture(
+        self,
+        settings: CaptureSettings,
+    ) -> NICaptureSession:
+        """Validate a complete request and construct an unprepared session."""
         if not isinstance(settings, NICaptureSettings):
-            raise TypeError("NI capture requires NICaptureSettings.")
+            raise TypeError("settings must be NICaptureSettings.")
+
+        self._validate_capture_settings(settings)
+        return NICaptureSession(self, settings)
+
+    def _validate_capture_settings(self, settings: CaptureSettings) -> None:
         if settings.batch_count is None:
             raise NotImplementedError("NI capture requires finite batch_count.")
         if settings.timestamps_enabled and settings.external_clock is not None:
@@ -244,14 +263,11 @@ class NIDigitizer(Digitizer):
                 "NI capture does not support record triggers yet."
             )
 
-        return NICaptureSession(self, settings)
-
-    def create_capture(self, settings: CaptureSettings) -> NICaptureSession:
-        """Construct an unprepared NI session using the core factory checks.
-
-        Require NICaptureSettings at runtime. Keep the base argument type so
-        this override remains compatible with the generic digitizer API.
-        """
+    def create_capture(
+        self,
+        settings: CaptureSettings | None = None,
+    ) -> NICaptureSession:
+        """Construct NI capture from explicit settings or the stored profile."""
         return cast(NICaptureSession, super().create_capture(settings))
 
     def _close(self) -> None:
@@ -261,6 +277,96 @@ class NIDigitizer(Digitizer):
     def _snapshot_settings(self) -> dict[str, object]:
         """Describe the configured connection without probing the device."""
         return {"physical_channels": self.config.expanded_channels}
+
+    def _create_profile_capture(
+        self,
+        profile: DigitizerProfile,
+    ) -> NICaptureSession:
+        """Construct NI capture with deferred geometry."""
+        return NICaptureSession(self, profile=profile)
+
+    def _settings_from_profile(
+        self,
+        profile: DigitizerProfile,
+        *,
+        record_length: int,
+        records_per_batch: int,
+        batch_count: int | None,
+        timestamps_enabled: bool,
+        trigger_offset_samples: int,
+    ) -> NICaptureSettings:
+        """Resolve settings supported by the current NI input implementation."""
+        selected = tuple(channel for channel in profile.channels if channel.enabled)
+        first = selected[0]
+
+        if first.input_range is None:
+            raise ValueError("NI profiles must specify enabled-channel input ranges.")
+
+        for channel in selected:
+            if channel.input_range != first.input_range:
+                raise NotImplementedError(
+                    "NI capture currently requires one shared input range."
+                )
+
+            if (
+                channel.inverted
+                or channel.coupling is not None
+                or channel.impedance is not None
+                or channel.offset is not None
+            ):
+                raise NotImplementedError(
+                    "The current NI backend supports profile input_range "
+                    "but not explicit coupling, impedance, offset, or inversion."
+                )
+
+        trigger = profile.trigger
+        if any(
+            value is not None
+            for value in (
+                trigger.level,
+                trigger.external_coupling,
+                trigger.external_impedance,
+                trigger.external_range,
+            )
+        ):
+            raise NotImplementedError(
+                "The current NI backend does not implement profile "
+                "electrical trigger settings."
+            )
+
+        external_clock = None
+        if profile.sample_clock.source.value == "external":
+            source = self.config.sample_clock_input
+            if not source:
+                raise ValueError(
+                    "External sampling requires config.sample_clock_input."
+                )
+
+            external_clock = ExternalSampleClock(
+                source=source,
+                max_rate=profile.sample_clock.rate,
+                active_edge=SignalEdge(profile.sample_clock.edge.value),
+            )
+
+        common = capture_settings_from_profile(
+            profile,
+            record_length=record_length,
+            records_per_batch=records_per_batch,
+            batch_count=batch_count,
+            timestamps_enabled=timestamps_enabled,
+            trigger_offset_samples=trigger_offset_samples,
+            external_clock=external_clock,
+        )
+
+        settings = NICaptureSettings(
+            **{
+                item.name: getattr(common, item.name)
+                for item in fields(CaptureSettings)
+            },
+            input_voltage_range=first.input_range,
+        )
+        self._validate_capture_settings(settings)
+        return settings
 
 
 class NICaptureSession(DigitizerCaptureSession):
@@ -276,14 +382,23 @@ class NICaptureSession(DigitizerCaptureSession):
     prepared sample rate, relative to the first sample.
     """
 
-    def __init__(self, digitizer: NIDigitizer, settings: NICaptureSettings) -> None:
-        super().__init__(
-            digitizer,
-            batch_count=settings.batch_count,
-            timestamps_enabled=settings.timestamps_enabled,
-        )
+    def __init__(
+        self,
+        digitizer: NIDigitizer,
+        settings: NICaptureSettings | None = None,
+        *,
+        profile: DigitizerProfile | None = None,
+    ) -> None:
+        """Accept complete settings or an immutable profile snapshot."""
+        if (settings is None) == (profile is None):
+            raise ValueError("Supply exactly one of settings or profile.")
+
+        super().__init__(digitizer, profile=profile)
+
+        if settings is not None:
+            self._set_capture_settings(settings)
+
         self._ni_digitizer = digitizer
-        self._settings = settings
         self._task: nidaqmx.Task | None = None
         self._reader: stream_readers.AnalogUnscaledReader | None = None
         self._pending: SampleArray | None = None
@@ -291,9 +406,19 @@ class NICaptureSession(DigitizerCaptureSession):
         self._pending_count = 0
         self._timing: _PreparedTiming | None = None
 
+    @property
+    def settings(self) -> NICaptureSettings:
+        """Complete NI request after configuration."""
+        settings = super().settings
+
+        if not isinstance(settings, NICaptureSettings):
+            raise TypeError("NI capture requires NICaptureSettings.")
+
+        return settings
+
     def _prepare_capture(self) -> CaptureLayout:
         """Configure and commit AI resources without starting or reading samples."""
-        settings = self._settings
+        settings = self.settings
         batch_count = settings.batch_count
         assert batch_count is not None
 
@@ -354,6 +479,15 @@ class NICaptureSession(DigitizerCaptureSession):
         )
 
         timing = self._read_prepared_timing(task)
+        if (
+            self.profile is not None
+            and timing.sample_rate is not None
+            and timing.sample_rate != self.requested_sample_rate
+        ):
+            raise ValueError(
+                "NI coerced the profile sample rate. Select the effective rate "
+                "in the profile before calculating capture geometry."
+            )
         self._prepare_readout(task, layout)
         self._ni_digitizer._sample_format = sample_format
         self._timing = timing
@@ -517,7 +651,7 @@ class NICaptureSession(DigitizerCaptureSession):
             raise RuntimeError("NI reported an invalid sample-clock terminal.")
 
         sample_rate: units.SampleRate | None = None
-        if self._settings.external_clock is None:
+        if self.settings.external_clock is None:
             rate = float(task.timing.samp_clk_rate)
             if not math.isfinite(rate) or rate <= 0:
                 raise RuntimeError("NI reported an invalid sample rate.")

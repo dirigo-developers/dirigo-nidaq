@@ -6,10 +6,10 @@ from dataclasses import dataclass
 from dirigo import units
 from dirigo.hardware.digitizer import Digitizer
 from dirigo.hardware.frame_plan import RecordFramePlan
-from dirigo.hardware.hardware import Hardware
 from dirigo.hardware.scanner import GalvoScanner
 from dirigo.hardware.timing import ExternalSampleClock, SignalEdge
 from dirigo.hardware.waveform import AngularWaveform
+from dirigo.system import System
 
 from dirigo_nidaq.triggered_sequence import NITriggeredFrameSequence
 
@@ -43,16 +43,16 @@ class NITriggeredSequenceFactory:
         config: NITriggeredSequenceConfig,
         /,
         *,
-        hardware: Hardware,
+        system: System,
         plan: RecordFramePlan,
         waveforms: Mapping[str, AngularWaveform],
     ) -> NITriggeredFrameSequence:
         """Resolve borrowed devices and preserve the exact capture request."""
-        digitizer = hardware.require(config.digitizer, Digitizer)
+        digitizer = system.require_device(config.digitizer, Digitizer)
         bindings: dict[GalvoScanner, AngularWaveform] = {}
 
         for name, waveform in waveforms.items():
-            axis = hardware.require(name, GalvoScanner)
+            axis = system.require_device(name, GalvoScanner)
             if axis in bindings:
                 raise ValueError("Waveforms must target distinct scanners.")
             bindings[axis] = waveform
