@@ -8,8 +8,6 @@ from unittest.mock import Mock
 import nidaqmx
 import pytest
 from dirigo import units
-from dirigo.hardware.capture import CaptureSettings
-from dirigo.hardware.frame_plan import RecordFramePlan
 from dirigo.hardware.output import OutputState
 from dirigo.hardware.timing import DigitalStartTrigger, ExternalSampleClock, SignalEdge
 from nidaqmx import constants
@@ -53,32 +51,16 @@ def ni(monkeypatch: pytest.MonkeyPatch) -> FakeNI:
 
 
 @pytest.fixture
-def plan() -> RecordFramePlan:
-    """Put two six-record frames across three four-record transfer batches."""
-    return RecordFramePlan(
-        capture_settings=CaptureSettings(
-            sample_rate=units.SampleRate("100 MS/s"),
-            record_length=4096,
-            records_per_batch=4,
-            batch_count=3,
-        ),
-        records_per_frame=6,
-    )
-
-
-@pytest.fixture
 def clock() -> ExternalSampleClock:
     """Describe the record-event source independently of ADC sample timing."""
     return ExternalSampleClock(source="/Dev1/PFI0", max_rate=units.SampleRate("8 kS/s"))
 
 
 @pytest.fixture
-def session(
-    plan: RecordFramePlan, clock: ExternalSampleClock
-) -> Iterator[NIFrameClockSession]:
+def session(clock: ExternalSampleClock) -> Iterator[NIFrameClockSession]:
     """Close the counter session even if a test assertion fails."""
     output = NIFrameClockSession(
-        plan,
+        records_per_frame=6,
         counter_channel="Dev1/ctr0",
         record_clock=clock,
     )
@@ -102,7 +84,6 @@ def test_construction_and_unused_close_are_passive(
 @pytest.mark.parametrize("edge", [SignalEdge.RISING, SignalEdge.FALLING])
 @pytest.mark.parametrize("export", [None, "/Dev1/PFI1"])
 def test_prepare_programs_continuous_counter_and_internal_route(
-    plan: RecordFramePlan,
     clock: ExternalSampleClock,
     ni: FakeNI,
     edge: SignalEdge,
@@ -110,7 +91,7 @@ def test_prepare_programs_continuous_counter_and_internal_route(
 ) -> None:
     """Program a divider with default initial delay and optional export."""
     output = NIFrameClockSession(
-        plan,
+        records_per_frame=6,
         counter_channel="/Dev1/ctr2",
         record_clock=replace(clock, active_edge=edge),
         export_terminal=export,
@@ -303,7 +284,16 @@ def test_native_failure_preserves_primary_and_closes_once(
 @pytest.mark.parametrize(
     ("field", "value", "error_type"),
     [
-        ("plan", object(), TypeError),
+        ("records_per_frame", None, TypeError),
+        ("records_per_frame", True, TypeError),
+        ("records_per_frame", False, TypeError),
+        ("records_per_frame", 6.0, TypeError),
+        ("records_per_frame", "6", TypeError),
+        ("records_per_frame", -1, ValueError),
+        ("records_per_frame", 0, ValueError),
+        ("records_per_frame", 1, ValueError),
+        ("records_per_frame", 2, ValueError),
+        ("records_per_frame", 3, ValueError),
         ("record_clock", object(), TypeError),
         ("counter_channel", None, TypeError),
         ("counter_channel", "Dev1/port0/line0", ValueError),
@@ -313,55 +303,47 @@ def test_native_failure_preserves_primary_and_closes_once(
     ],
 )
 def test_constructor_rejects_invalid_arguments(
-    plan: RecordFramePlan,
     clock: ExternalSampleClock,
     ni: FakeNI,
     field: str,
     value: object,
     error_type: type[Exception],
 ) -> None:
-    """Reject unsupported models, counter descriptions, and export terminals."""
+    """Reject invalid divider periods and connection descriptions passively."""
     with pytest.raises(error_type):
         NIFrameClockSession(
-            cast(RecordFramePlan, value) if field == "plan" else plan,
+            records_per_frame=(cast(int, value) if field == "records_per_frame" else 6),
             counter_channel=(
                 cast(str, value) if field == "counter_channel" else "Dev1/ctr0"
             ),
             record_clock=(
                 cast(ExternalSampleClock, value) if field == "record_clock" else clock
             ),
-            export_terminal=cast(str, value) if field == "export_terminal" else None,
+            export_terminal=(
+                cast(str | None, value) if field == "export_terminal" else None
+            ),
         )
-    ni.factory.assert_not_called()
 
-
-@pytest.mark.parametrize("records", [1, 2, 3])
-def test_frame_size_must_allow_two_high_and_two_low_ticks(
-    plan: RecordFramePlan, clock: ExternalSampleClock, ni: FakeNI, records: int
-) -> None:
-    """Reject counter periods too short for two high and two low ticks."""
-    with pytest.raises(ValueError, match="at least four"):
-        NIFrameClockSession(
-            replace(plan, records_per_frame=records),
-            counter_channel="Dev1/ctr0",
-            record_clock=clock,
-        )
     ni.factory.assert_not_called()
 
 
 @pytest.mark.parametrize("records", [4, 6, 12])
-def test_period_follows_the_plan(
-    plan: RecordFramePlan, clock: ExternalSampleClock, ni: FakeNI, records: int
+def test_period_follows_records_per_frame(
+    clock: ExternalSampleClock,
+    ni: FakeNI,
+    records: int,
 ) -> None:
-    """Support the minimum period and a single-frame run without padding records."""
+    """Set the divider period independently of capture batching or run length."""
     output = NIFrameClockSession(
-        replace(plan, records_per_frame=records),
+        records_per_frame=records,
         counter_channel="Dev1/ctr0",
         record_clock=clock,
     )
     try:
         output.prepare()
-        assert ni.channel.co_pulse_high_ticks + ni.channel.co_pulse_low_ticks == records
+
+        assert ni.channel.co_pulse_high_ticks == 2
+        assert ni.channel.co_pulse_low_ticks == records - 2
         ni.task.timing.cfg_implicit_timing.assert_called_once_with(
             sample_mode=constants.AcquisitionType.CONTINUOUS,
         )

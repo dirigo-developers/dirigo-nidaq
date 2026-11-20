@@ -233,6 +233,11 @@ class _RecordTriggeredRasterFrameSyncSession(RasterFrameSyncSession):
         """Current synchronization state, independent of capture EOF."""
         return self._state
 
+    @property
+    def max_record_rate(self) -> units.SampleRate:
+        """Configured upper bound on record-clock events."""
+        return self._config.max_record_rate
+
     def configure(
         self,
         *,

@@ -1,5 +1,6 @@
 """Repeat one grouped galvo waveform on hardware frame triggers."""
 
+import math
 import time
 from collections.abc import Mapping
 
@@ -94,9 +95,19 @@ class NIRetriggeredGalvoOutputSession(NIGalvoOutputSession):
         task.out_stream.regen_mode = constants.RegenerationMode.ALLOW_REGENERATION
 
     def _prepare_output(self) -> None:
-        """Preload through the shared NI implementation, then commit the task."""
+        """Preload and commit output, rejecting sample-rate coercion."""
         super()._prepare_output()
-        self._require_task().control(constants.TaskMode.TASK_COMMIT)
+
+        task = self._require_task()
+        task.control(constants.TaskMode.TASK_COMMIT)
+
+        actual_rate = float(task.timing.samp_clk_rate)
+
+        if not math.isfinite(actual_rate) or actual_rate <= 0:
+            raise RuntimeError("NI reported an invalid AO sample rate.")
+
+        if actual_rate != float(self._sample_rate):
+            raise ValueError("NI coerced the retriggered AO sample rate.")
 
     def _start_output(self) -> None:
         """Track possible activity even if NI partially starts before raising."""

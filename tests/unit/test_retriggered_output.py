@@ -54,6 +54,7 @@ def ni(monkeypatch: pytest.MonkeyPatch) -> FakeNI:
     """Replace public NI factories without loading native driver libraries."""
     task = Mock()
     task.is_task_done.return_value = False
+    task.timing.samp_clk_rate = 1000.0
     generated = PropertyMock(return_value=0)
     monkeypatch.setattr(
         type(task.out_stream),
@@ -485,5 +486,36 @@ def test_unlimited_output_requires_explicit_stop(
 
         output.stop()
         ni.task.stop.assert_called_once_with()
+    finally:
+        output.close()
+
+
+@pytest.mark.parametrize("actual_rate", [1000.0, 1001.0])
+def test_preparation_requires_requested_sample_rate(
+    axes: tuple[NIGalvoScanner, NIGalvoScanner],
+    ni: FakeNI,
+    actual_rate: float,
+) -> None:
+    """Reject waveform retiming before any output starts."""
+    ni.task.timing.samp_clk_rate = actual_rate
+
+    output = NIRetriggeredGalvoOutputSession(
+        {axes[0]: _waveform(0, 1, 2)},
+        start_trigger=DigitalStartTrigger(source="/Dev1/PFI1"),
+        frame_count=1,
+    )
+
+    try:
+        if actual_rate == 1000.0:
+            output.prepare()
+            assert output.state is OutputState.PREPARED
+        else:
+            with pytest.raises(ValueError, match="coerced"):
+                output.prepare()
+
+            assert output.state is OutputState.CLOSED
+            ni.task.close.assert_called_once_with()
+
+        ni.task.start.assert_not_called()
     finally:
         output.close()

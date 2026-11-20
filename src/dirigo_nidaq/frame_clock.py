@@ -3,7 +3,6 @@
 import re
 
 import nidaqmx
-from dirigo.hardware.frame_plan import RecordFramePlan
 from dirigo.hardware.output import OutputState
 from dirigo.hardware.timing import DigitalStartTrigger, ExternalSampleClock, SignalEdge
 from nidaqmx import constants
@@ -18,70 +17,56 @@ _NI_EDGES = {
 class NIFrameClockSession:
     """Divide acquired-record events into continuous frame-trigger pulses.
 
-    counter_channel selects one counter, e.g. Dev1/ctr0. record_clock supplies
-    one active edge per acquired record. Its max_rate describes record events,
-    not ADC samples. Counter timing uses these events directly as ticks.
+    record_clock supplies one active edge per acquired record. Its max_rate
+    describes record events, independently of the ADC sample rate.
 
     Each pulse is high for two ticks and low for records_per_frame - 2 ticks.
     At least four records per frame are required. Preparation requests zero
-    initial delay but permits NI's hardware minimum. A PCIe-6323 has reported
-    two record-clock ticks after committing that request. The first trigger
-    is therefore not guaranteed to coincide with the first acquired record.
-    Subsequent triggers remain records_per_frame ticks apart.
+    initial delay but permits NI's hardware minimum, so the first trigger is
+    not guaranteed to coincide with the first acquired record.
 
-    Logical frame grouping remains defined by the plan. Downstream frame
-    processing accounts for line alignment, including galvo response delay.
-    This session does not provide an adjustable alignment parameter.
+    trigger identifies CtrNInternalOutput for same-device AO routing.
+    export_terminal optionally exports the pulses to a physical terminal.
 
-    trigger identifies CtrNInternalOutput for same-device AO routing without
-    a jumper. export_terminal optionally also exports pulses to a physical
-    terminal. None disables the default PFI export.
+    Construction accesses no hardware. Arm AO, start this session, then
+    start capture. The record-clock source must remain quiet outside capture.
 
-    Construction accesses no hardware. Arm AO, start this session, then start
-    capture. The record-clock source must remain quiet outside acquisition.
-
-    The plan supplies the divider period; frame_count does not limit this
-    continuous task. There is no wait() or natural COMPLETED state. The owner
-    explicitly stops the counter after capture and AO finish, or during
-    cancellation. stop() retains resources until close() and may interrupt a
-    pulse. No parking commands or static digital writes are performed.
+    The counter runs continuously until explicitly stopped. It has no
+    natural completion and provides no wait method. stop() retains resources
+    until close() and may interrupt a pulse.
     """
 
     def __init__(
         self,
-        plan: RecordFramePlan | None = None,
         *,
-        records_per_frame: int | None = None,
+        records_per_frame: int,
         counter_channel: str,
         record_clock: ExternalSampleClock,
         export_terminal: str | None = None,
     ) -> None:
-        """Validate the finite plan and connection descriptions without NI calls."""
-        if records_per_frame is None:
-            if not isinstance(plan, RecordFramePlan):
-                raise TypeError("plan must be a RecordFramePlan.")
-            records_per_frame = plan.records_per_frame
-        elif plan is not None:
-            raise ValueError("Supply either plan or records_per_frame.")
-
+        """Validate the divider period and routes without accessing hardware."""
         if type(records_per_frame) is not int:
-            raise TypeError("records_per_frame must be an integer.")
-
+            raise TypeError("records_per_frame must be an int.")
         if records_per_frame < 4:
             raise ValueError(
                 "Counter frame clock requires at least four records per frame."
             )
+
         if not isinstance(record_clock, ExternalSampleClock):
             raise TypeError("record_clock must be an ExternalSampleClock.")
+
         if not isinstance(counter_channel, str):
             raise TypeError("counter_channel must be a string.")
         match = re.fullmatch(
-            r"/?([A-Za-z0-9_-]+)/ctr([0-9]+)", counter_channel, flags=re.IGNORECASE
+            r"/?([A-Za-z0-9_-]+)/ctr([0-9]+)",
+            counter_channel,
+            flags=re.IGNORECASE,
         )
         if match is None:
             raise ValueError(
                 "counter_channel must name one NI counter, e.g. Dev1/ctr0."
             )
+
         if export_terminal is not None:
             if not isinstance(export_terminal, str):
                 raise TypeError("export_terminal must be a string or None.")

@@ -660,3 +660,10 @@ class NICaptureSession(DigitizerCaptureSession):
             sample_rate = units.SampleRate(rate)
 
         return _PreparedTiming(sample_rate, terminal)
+
+    def _resolve_record_length_constraints(self) -> tuple[int, int]:
+        """NI logical record boundaries are software sample windows.
+
+        Native constraints on the complete input run remain preparation checks.
+        """
+        return 1, 1

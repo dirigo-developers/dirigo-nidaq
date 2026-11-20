@@ -109,38 +109,3 @@ final_angle = "0 deg"
 settling_time = "100 ms"
 timeout = "5 s"
 
-
-# Supply running TTL record triggers to the Alazar external-trigger input.
-# Connect Alazar's configurable acquisition-active AUX output to Dev1/PFI0.
-# Connect NI Dev1/port0/line0 to Dev1/PFI1 for the AO frame-start trigger.
-# Use the appropriate common signal reference for these connections.
-#
-# This preset expects at most 8,000 acquired-record events per second:
-# 128 records/frame gives at least 16 ms between frame starts.
-# 100 AO samples at 20 kS/s gives a 5 ms constant waveform per trigger.
-# 64 records/batch x 6 batches gives 384 records and three complete frames.
-
-[test.triggered_sequence]
-digitizer = "alazar_digitizer"
-scanner = "galvo_x"
-record_clock_input = "/Dev1/PFI0"
-max_record_rate = "8 kS/s"
-frame_clock_output = "Dev1/port0/line0"
-frame_trigger_input = "/Dev1/PFI1"
-records_per_frame = 128
-sample_rate = "100 MS/s"
-record_length = 4096
-records_per_batch = 64
-batch_count = 6
-channel_indices = [0, 1]
-input_voltage_range = {min = "-1 V", max = "1 V"}
-input_impedance = "50 ohm"
-input_coupling = "DC"
-trigger_edge = "rising"
-dma_buffer_count = 4
-ao_sample_rate = "20 kS/s"
-ao_sample_count = 100
-command_angle = "0 deg"
-final_angle = "0 deg"
-settling_time = "100 ms"
-timeout = "5 s"
